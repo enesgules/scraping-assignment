@@ -1,4 +1,4 @@
-Build a trial scraper for the los angeles [case record system](https://www.lacourt.ca.gov/). 
+# Trial court scraper for the los angeles [case record system](https://www.lacourt.ca.gov/). 
 
 Based on my investigation the following can be done:
 - Enumerate through predictable case numbers     
@@ -12,3 +12,4 @@ You have access to a browser base account that does the following:
 - Browser instance in a cloud environment, connected to the internet through a proxy
 - Connect and use it through the factory and playwight
 
+The code can be ran using `uv run scraper`
