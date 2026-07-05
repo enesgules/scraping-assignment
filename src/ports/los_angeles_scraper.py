@@ -161,18 +161,13 @@ class LosAngelesScraper(TrialScraper):
             f"downloading {len(selected)}"
         )
 
+        documents: list[ScrapedTrialDocument] = []
         for i, d in enumerate(selected, 1):
             print(
                 f"  [{case_number}] downloading {i}/{len(selected)}: {d['description']}"
             )
-            await self._trigger_download(page, d)
-
-        pdf_by_id = await self._fetch_downloads(bb, {d["docId"] for d in selected})
-
-        documents: list[ScrapedTrialDocument] = []
-        for d in selected:
-            raw = pdf_by_id.get(d["docId"])
-            if not raw:
+            raw = await self._download_document(page, bb, d)
+            if raw is None:
                 print(f"  [{case_number}] doc {d['docId']} not captured, skipping")
                 continue
             docket_date = _parse_date(d["date"])
@@ -224,41 +219,50 @@ class LosAngelesScraper(TrialScraper):
             docs += await page.evaluate(_EXTRACT_DOCS)
         return docs
 
-    async def _fetch_downloads(
-        self, bb: BrowserBase, wanted: set[str]
-    ) -> dict[str, bytes]:
-        """Pull the downloads zip, retrying while expected PDFs are still
-        syncing to Browserbase storage (a fixed sleep could drop a slow one)."""
-        pdf_by_id: dict[str, bytes] = {}
-        for _ in range(4):
-            pdf_by_id = _pdfs_by_doc_id(await bb.get_downloads())
-            if wanted <= pdf_by_id.keys():
-                break  # every expected doc has arrived
-            await asyncio.sleep(2)
-        return pdf_by_id
+    async def _download_document(
+        self, page: Page, bb: BrowserBase, doc: dict[str, str]
+    ) -> bytes | None:
+        """Return the document's PDF bytes, or None if it can't be captured.
 
-    async def _trigger_download(self, page: Page, doc: dict[str, str]) -> None:
-        """Drive Preview (captcha auto-solved) until Chrome starts the PDF
-        download. Retries once — captcha solving is best-effort."""
+        Success means a valid PDF actually landed in Browserbase storage — not
+        merely that a download started. A started-but-empty download is retried
+        with a fresh preview, which issues a new one-time link, so a transient
+        bad response gets another shot."""
+        doc_id = doc["docId"]
+        for attempt in range(2):
+            if await self._trigger_download(page, doc):
+                # The PDF may take a moment to sync into storage after starting.
+                for _ in range(4):
+                    pdf = _pdfs_by_doc_id(await bb.get_downloads()).get(doc_id)
+                    if pdf:
+                        return pdf
+                    await asyncio.sleep(2)
+            if attempt == 0:
+                print(f"    [{doc_id}] no PDF landed, retrying preview")
+        return None
+
+    async def _trigger_download(self, page: Page, doc: dict[str, str]) -> bool:
+        """Open the captcha-gated Preview once and return True if Chrome starts
+        the PDF download (False if it never starts). Browserbase solves the
+        captcha while we wait; retrying is handled by _download_document."""
         preview_url = (
             f"{BASE}/DocumentImages/PreviewWait?id={quote(doc['docId'])}"
             f"&securityKey={quote(doc['securityKey'])}"
             f"&source={quote(doc['source'])}&caseType={quote(doc['caseType'])}"
             f"&caseNumber={quote(doc['caseNumber'])}"
         )
-        for attempt in range(2):
-            try:
-                async with page.expect_download(timeout=120000):
-                    try:
-                        await page.goto(
-                            preview_url, wait_until="domcontentloaded", timeout=120000
-                        )
-                    except Exception:
-                        pass  # navigation aborts when the download begins
-                await page.wait_for_timeout(3000)  # let Browserbase sync it
-                return
-            except PlaywrightTimeoutError:
-                print(f"  doc {doc['docId']} no download (attempt {attempt + 1})")
+        try:
+            async with page.expect_download(timeout=120000):
+                try:
+                    await page.goto(
+                        preview_url, wait_until="domcontentloaded", timeout=120000
+                    )
+                except Exception:
+                    pass  # navigation aborts when the download begins
+            await page.wait_for_timeout(3000)  # let Browserbase sync it
+            return True
+        except PlaywrightTimeoutError:
+            return False
 
 
 def _pdfs_by_doc_id(zip_bytes: bytes) -> dict[str, bytes]:
