@@ -88,6 +88,10 @@ class LosAngelesScraper(TrialScraper):
         self.max_docs = int(os.environ.get("LA_MAX_DOCS", "5"))
 
     async def scrape(self, insert_case: InsertCase) -> None:
+        print(
+            f"[los_angeles] starting — up to {self.max_cases} case(s), "
+            f"{self.max_docs} doc(s) each; opening browser…"
+        )
         bb = self.browser.new_browser_base()
         attempted = 0
         scraped = 0
@@ -136,6 +140,7 @@ class LosAngelesScraper(TrialScraper):
                 # Session likely expired back to login; re-establish and retry.
                 await self._continue_as_guest(page)
 
+        print(f"[{case_number}] searching…")
         await page.fill("#CaseNumber", case_number)
         # The results table is server-rendered, so waiting for the search POST
         # to finish navigating guarantees it's present — no blind sleep, no
@@ -145,17 +150,21 @@ class LosAngelesScraper(TrialScraper):
 
         docs = await page.evaluate(_EXTRACT_DOCS)
         if not docs:
+            print(f"[{case_number}] no documents — skipping")
             return None  # case not found or has no imaged documents
         html = await page.content()  # page 1 carries the case metadata
 
         docs = await self._collect_all_documents(page, docs)
+        selected = docs[: self.max_docs]
         print(
-            f"[{case_number}] found {len(docs)} document(s); "
-            f"downloading up to {self.max_docs}"
+            f"[{case_number}] {len(docs)} document(s) found; "
+            f"downloading {len(selected)}"
         )
 
-        selected = docs[: self.max_docs]
-        for d in selected:
+        for i, d in enumerate(selected, 1):
+            print(
+                f"  [{case_number}] downloading {i}/{len(selected)}: {d['description']}"
+            )
             await self._trigger_download(page, d)
 
         pdf_by_id = await self._fetch_downloads(bb, {d["docId"] for d in selected})
