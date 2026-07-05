@@ -13,6 +13,7 @@ the download is captcha-gated, so driving one proxied browser is simpler than
 juggling a saved session for HTTP calls.
 """
 
+import asyncio
 import hashlib
 import io
 import os
@@ -79,6 +80,8 @@ class LosAngelesScraper(TrialScraper):
         # Runtime knobs (see README), read once here. Small, bounded run by
         # default: prove the pipeline on one or two real cases rather than
         # sweep thousands of empty sequence numbers.
+        # TODO: env read here (not entry.py) because the pipeline's scraper
+        # constructor is fixed; centralize if that interface gains a config slot.
         raw = os.environ.get("LA_CASE_NUMBERS", "")
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
         self.max_cases = int(os.environ.get("LA_MAX_CASES", "1"))
@@ -86,17 +89,24 @@ class LosAngelesScraper(TrialScraper):
 
     async def scrape(self, insert_case: InsertCase) -> None:
         bb = self.browser.new_browser_base()
+        attempted = 0
+        scraped = 0
         async with bb as (_session, page):
             await self._continue_as_guest(page)
-            scraped = 0
             for case_number in self._target_case_numbers():
                 if scraped >= self.max_cases:
                     break
-                case = await self._scrape_case(page, bb, case_number)
+                attempted += 1
+                try:
+                    case = await self._scrape_case(page, bb, case_number)
+                except Exception as exc:  # one bad case must not kill the sweep
+                    print(f"[{case_number}] error, skipping: {exc!r}")
+                    continue
                 if case is None:
                     continue
                 await insert_case(case)
                 scraped += 1
+        print(f"[los_angeles] done: scraped {scraped} of {attempted} case(s) tried")
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -127,8 +137,11 @@ class LosAngelesScraper(TrialScraper):
                 await self._continue_as_guest(page)
 
         await page.fill("#CaseNumber", case_number)
-        await page.click("input[value='Search']")
-        await page.wait_for_timeout(4000)
+        # The results table is server-rendered, so waiting for the search POST
+        # to finish navigating guarantees it's present — no blind sleep, no
+        # reading a still-loading page and mistaking it for "no documents".
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=90000):
+            await page.click("input[value='Search']")
 
         docs = await page.evaluate(_EXTRACT_DOCS)
         if not docs:
@@ -145,7 +158,7 @@ class LosAngelesScraper(TrialScraper):
         for d in selected:
             await self._trigger_download(page, d)
 
-        pdf_by_id = _pdfs_by_doc_id(await bb.get_downloads())
+        pdf_by_id = await self._fetch_downloads(bb, {d["docId"] for d in selected})
 
         documents: list[ScrapedTrialDocument] = []
         for d in selected:
@@ -153,9 +166,13 @@ class LosAngelesScraper(TrialScraper):
             if not raw:
                 print(f"  [{case_number}] doc {d['docId']} not captured, skipping")
                 continue
+            docket_date = _parse_date(d["date"])
+            if docket_date is None:
+                print(f"  [{case_number}] doc {d['docId']} bad date {d['date']!r}")
+                continue
             documents.append(
                 ScrapedTrialDocument(
-                    docket_entry_date=_parse_date(d["date"]),
+                    docket_entry_date=docket_date,
                     content_hash=hashlib.sha256(raw).hexdigest(),
                     is_opinion=_is_opinion(d["description"]),
                     description=d["description"],
@@ -197,6 +214,19 @@ class LosAngelesScraper(TrialScraper):
             await page.wait_for_timeout(2500)
             docs += await page.evaluate(_EXTRACT_DOCS)
         return docs
+
+    async def _fetch_downloads(
+        self, bb: BrowserBase, wanted: set[str]
+    ) -> dict[str, bytes]:
+        """Pull the downloads zip, retrying while expected PDFs are still
+        syncing to Browserbase storage (a fixed sleep could drop a slow one)."""
+        pdf_by_id: dict[str, bytes] = {}
+        for _ in range(4):
+            pdf_by_id = _pdfs_by_doc_id(await bb.get_downloads())
+            if wanted <= pdf_by_id.keys():
+                break  # every expected doc has arrived
+            await asyncio.sleep(2)
+        return pdf_by_id
 
     async def _trigger_download(self, page: Page, doc: dict[str, str]) -> None:
         """Drive Preview (captcha auto-solved) until Chrome starts the PDF
@@ -246,8 +276,13 @@ def _doc_id_in(filename: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _parse_date(text: str) -> datetime:
-    return datetime.strptime(text.strip(), "%m/%d/%Y")
+def _parse_date(text: str) -> datetime | None:
+    # Rows normally carry an M/D/YYYY date, but guard the odd empty/malformed
+    # cell — a bare strptime would crash the case after downloads were spent.
+    try:
+        return datetime.strptime(text.strip(), "%m/%d/%Y")
+    except ValueError:
+        return None
 
 
 def _is_opinion(description: str) -> bool:

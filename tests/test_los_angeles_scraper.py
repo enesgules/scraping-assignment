@@ -60,6 +60,8 @@ def test_pdfs_by_doc_id_empty():
 def test_parse_date():
     assert _parse_date("4/9/2019") == datetime(2019, 4, 9)
     assert _parse_date(" 9/21/2020 ") == datetime(2020, 9, 21)
+    assert _parse_date("") is None  # missing cell must not crash the case
+    assert _parse_date("not a date") is None
 
 
 def test_is_opinion():
