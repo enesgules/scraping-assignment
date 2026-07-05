@@ -8,7 +8,8 @@ from .application.scraping_pipeline import (
     ScrapingPipelineDeps,
     create_scraping_pipeline,
 )
-from .ports import BrowserBaseFactory, LosAngelesScraper
+from .browser_base_factory import BrowserBaseFactory
+from .ports import LosAngelesScraper
 
 load_dotenv()
 

@@ -1,4 +1,4 @@
-from .browser_base_factory import BrowserBaseFactory
+from ..browser_base_factory import BrowserBaseFactory
 
 from ..models import TrialScraper, InsertCase, ScrapedTrialCase
 

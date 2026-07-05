@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from datetime import date
 
-from ..ports import BrowserBaseFactory
+from ..browser_base_factory import BrowserBaseFactory
 from ..models import TrialScraper, ScrapedTrialCase
 
 
 @dataclass
 class ScrapingPipelineDeps:
-    browser_base: BrowserFactory
+    browser_base: BrowserBaseFactory
     scrapers: list[type[TrialScraper]]
 
 
@@ -25,7 +25,7 @@ def create_scraping_pipeline(deps: ScrapingPipelineDeps):
             )
 
         for Scraper in deps.scrapers:
-            scraper = Scraper(to_date, from_date)
+            scraper = Scraper(to_date, from_date, deps.browser_base)
             await scraper.scrape(insert_case)
 
     return scraping_pipeline
