@@ -22,7 +22,7 @@ def require_env(k: str) -> str:
 
 pipeline = create_scraping_pipeline(
     deps=ScrapingPipelineDeps(
-        broswer_base=BrowserBaseFactory(
+        browser_base=BrowserBaseFactory(
             project_id=require_env("BROWSERBASE_PROJECT_ID"),
             api_key=require_env("BROWSERBASE_API_KEY"),
         ),

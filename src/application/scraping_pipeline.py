@@ -7,7 +7,7 @@ from ..models import TrialScraper, ScrapedTrialCase
 
 @dataclass
 class ScrapingPipelineDeps:
-    broswer_base: BrowserBaseFactory
+    browser_base: BrowserFactory
     scrapers: list[type[TrialScraper]]
 
 
