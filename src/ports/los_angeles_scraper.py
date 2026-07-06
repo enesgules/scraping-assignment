@@ -19,9 +19,8 @@ import asyncio
 import hashlib
 import os
 import re
-import sys
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from html import unescape
 from typing import Any
@@ -121,6 +120,11 @@ _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 # captcha-gated previews is structural: _TABS_PER_SESSION x workers.
 _TABS_PER_SESSION = 3
 
+# LA_MAX_DOCS=0 means "every document in the case". Encoded as a cap larger than
+# any real case (biggest seen ~100 docs) so the len(docs) < cap comparison and
+# the docs[:cap] slice both just work. ponytail: bump if a case ever exceeds it.
+_NO_DOC_CAP = 1_000_000
+
 
 class LosAngelesScraper(TrialScraper):
     scraper_id = "los_angeles"
@@ -131,13 +135,14 @@ class LosAngelesScraper(TrialScraper):
         self, to_date: date, from_date: date, browser: BrowserBaseFactory
     ) -> None:
         super().__init__(to_date, from_date, browser)
-        # Runtime knobs (see README), read once here. Defaults give a small but
-        # non-trivial run — a few real cases, downloaded concurrently — not a
-        # sweep of thousands of empty sequence numbers.
+        # Runtime knobs (see README), read once here. Defaults do a real scrape:
+        # many cases, every document each. Narrow with LA_MAX_CASES / LA_MAX_DOCS,
+        # or target specific cases with LA_CASE_NUMBERS.
         raw = os.environ.get("LA_CASE_NUMBERS", "")
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
-        self.max_cases = int(os.environ.get("LA_MAX_CASES", "3"))
-        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "10"))
+        self.max_cases = int(os.environ.get("LA_MAX_CASES", "50"))
+        # 0 / unset = every document in the case (no cap).
+        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "0")) or _NO_DOC_CAP
         # Worker sessions (each probes + downloads + runs pool tabs). Measured
         # sweet spot ~16: throughput rose 8->16 (20.6->23.7 docs/min) then FELL
         # at 25 (16.0, 11% of docs failed) as ~75 concurrent captchas overload
@@ -161,11 +166,15 @@ class LosAngelesScraper(TrialScraper):
         self._all_workers_done = asyncio.Event()
 
     async def scrape(self, insert_case: InsertCase) -> None:
-        # No point opening more sessions than explicit case numbers to search.
-        workers = min(self.concurrency, len(self.case_numbers) or self.concurrency)
+        # Open the full complement even when there are fewer explicit case
+        # numbers than workers: a worker with nothing left to probe parks and
+        # its pool tabs keep solving, so extra sessions are download-only
+        # muscle (one case's 60 docs solve across 4 sessions, not 1).
+        workers = self.concurrency
+        docs_label = "all" if self.max_docs >= _NO_DOC_CAP else self.max_docs
         print(
             f"[los_angeles] starting — up to {self.max_cases} case(s), "
-            f"{self.max_docs} doc(s) each; opening {workers} browser session(s)…"
+            f"{docs_label} doc(s) each; opening {workers} browser session(s)…"
         )
         started = time.monotonic()
         self._active_workers = workers
@@ -196,14 +205,18 @@ class LosAngelesScraper(TrialScraper):
     async def _worker(self, case_iter: Iterator[str], insert_case: InsertCase) -> None:
         """Pull case numbers off the shared iterator until the quota is filled
         or the numbers run out, probing and downloading in ONE long-lived
-        session so there's no fresh session (or re-search) per case. Sharing a
-        plain iterator between workers is safe: next() has no await point."""
+        session so there's no fresh session (or re-search) per case. When out
+        of work the worker parks — its pool tabs keep solving captchas for
+        other workers' cases — until every worker is done. Sharing a plain
+        iterator between workers is safe: next() has no await point."""
         retired = False
 
         def retire() -> None:
-            # Idempotent: runs in the probe loop's finally AND the outer one,
-            # so a session that dies during setup still gets counted down —
-            # otherwise every other worker would park forever below.
+            # Count this worker down exactly once, from wherever it stops:
+            # normal finish, quota break, or a session that died during setup.
+            # Reaching zero wakes the parked workers below. Idempotent because
+            # the normal path counts down (before parking) and the outer
+            # finally covers a setup failure that skipped that.
             nonlocal retired
             if retired:
                 return
@@ -213,66 +226,53 @@ class LosAngelesScraper(TrialScraper):
                 self._all_workers_done.set()
 
         try:
-            await self._worker_session(case_iter, insert_case, retire)
-        finally:
-            retire()
-
-    async def _worker_session(
-        self,
-        case_iter: Iterator[str],
-        insert_case: InsertCase,
-        retire: Callable[[], None],
-    ) -> None:
-        bb = self.browser.new_browser_base()
-        async with bb as (_session, page):
-            await self._continue_as_guest(page)
-            # This session's share of the download pool (see _download_documents).
-            consumers = [
-                asyncio.create_task(self._consume(bb, page))
-                for _ in range(_TABS_PER_SESSION)
-            ]
-            try:
-                for case_number in case_iter:
-                    if self._claimed >= self.max_cases:
-                        return  # quota already claimed (by any worker)
-                    self._attempted += 1
-                    try:
-                        print(f"[{case_number}] checking for documents…")
-                        docs, html, pages = await self._search(page, case_number)
-                    except Exception as exc:  # a bad case must not kill the sweep
-                        print(f"[{case_number}] error, skipping: {exc!r}")
-                        continue
-                    if not docs:
-                        print(f"[{case_number}] no documents")
-                        continue
-                    # Claim a slot *before* the expensive download-scrape so no
-                    # worker downloads a case beyond the quota.
-                    if self._claimed >= self.max_cases:
-                        return
-                    self._claimed += 1
-                    print(f"[{case_number}] found documents — downloading")
-                    try:
-                        case = await self._scrape_case(
-                            page, case_number, docs, html, pages
-                        )
-                    except Exception as exc:
-                        print(f"[{case_number}] error, skipping: {exc!r}")
-                        self._claimed -= 1  # slot didn't pan out; free it
-                        continue
-                    if case is None:
-                        self._claimed -= 1
-                        continue
-                    self._scraped += 1
-                    await insert_case(case)
-            finally:
-                retire()
+            bb = self.browser.new_browser_base()
+            async with bb as (_session, page):
+                await self._continue_as_guest(page)
+                # This session's share of the download pool (see
+                # _download_documents).
+                consumers = [
+                    asyncio.create_task(self._consume(bb, page))
+                    for _ in range(_TABS_PER_SESSION)
+                ]
                 try:
-                    # Out of cases, but other workers may still be downloading:
-                    # park here so this session's pool tabs keep solving their
-                    # captchas until everyone is done. A worker whose session
-                    # just broke (exception in flight) tears down instead.
-                    if sys.exc_info()[0] is None:
-                        await self._all_workers_done.wait()
+                    for case_number in case_iter:
+                        if self._claimed >= self.max_cases:
+                            break  # quota already claimed (by any worker)
+                        self._attempted += 1
+                        try:
+                            print(f"[{case_number}] checking for documents…")
+                            docs, html, pages = await self._search(page, case_number)
+                        except Exception as exc:  # a bad case must not kill the run
+                            print(f"[{case_number}] error, skipping: {exc!r}")
+                            continue
+                        if not docs:
+                            print(f"[{case_number}] no documents")
+                            continue
+                        # Claim a slot *before* the expensive download-scrape so
+                        # no worker downloads a case beyond the quota.
+                        if self._claimed >= self.max_cases:
+                            break
+                        self._claimed += 1
+                        print(f"[{case_number}] found documents — downloading")
+                        try:
+                            case = await self._scrape_case(
+                                page, case_number, docs, html, pages
+                            )
+                        except Exception as exc:
+                            print(f"[{case_number}] error, skipping: {exc!r}")
+                            self._claimed -= 1  # slot didn't pan out; free it
+                            continue
+                        if case is None:
+                            self._claimed -= 1
+                            continue
+                        self._scraped += 1
+                        await insert_case(case)
+                    # Out of work: count down, then park so this session's pool
+                    # tabs keep solving other workers' captchas until all done.
+                    # A session that broke mid-loop skips this and tears down.
+                    retire()
+                    await self._all_workers_done.wait()
                 finally:
                     # Cancelled consumers hand any in-flight job back to the
                     # queue, so a worker retiring early never strands another
@@ -280,6 +280,8 @@ class LosAngelesScraper(TrialScraper):
                     for c in consumers:
                         c.cancel()
                     await asyncio.gather(*consumers, return_exceptions=True)
+        finally:
+            retire()  # safety net for a session that died before/around setup
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -523,10 +525,16 @@ async def _collect_all_documents(
             wait_until="domcontentloaded",
             timeout=90000,
         )
-        # Every further page has doc rows, so wait for one instead of a blind
-        # sleep — a slow page must not silently truncate the document list.
-        await page.wait_for_selector("input[type=checkbox][id^='Doc']", timeout=30000)
-        docs += await page.evaluate(_EXTRACT_DOCS)
+        # Rows are server-rendered (DOMParser finds them in the raw HTML with
+        # no JS run), so they're in the DOM at domcontentloaded — no
+        # wait_for_selector here: its poller starves while sibling tabs solve
+        # captchas and timed out on healthy pages, dropping claimed cases.
+        # Every further page has doc rows, so an empty read means the session
+        # lost its case state — fail loudly rather than silently truncate.
+        page_docs = await page.evaluate(_EXTRACT_DOCS)
+        if not page_docs:
+            raise RuntimeError(f"results page {current} returned no document rows")
+        docs += page_docs
         page_numbers = await page.evaluate(_PAGE_LINKS)
     return docs
 

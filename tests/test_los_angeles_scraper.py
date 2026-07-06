@@ -138,9 +138,6 @@ class _FakePage:
     async def goto(self, url: str, **_: object) -> None:
         self.current = int(url.split("page=")[1])
 
-    async def wait_for_selector(self, _selector: str, **_: object) -> None:
-        pass
-
 
 def _collect(page: _FakePage, max_docs: int) -> list[dict[str, str]]:
     pager = list(range(2, len(page.pages) + 1))  # page 1's pager, as _search sees it
@@ -173,3 +170,16 @@ def test_paging_single_page_case():
     page = _FakePage(total_docs=20)
     docs = _collect(page, max_docs=1000)
     assert len(docs) == 20  # no next page; terminates cleanly
+
+
+def test_paging_raises_on_empty_further_page():
+    # Every real further page has doc rows; an empty read means the session
+    # lost its case state and must fail loudly, not silently truncate.
+    page = _FakePage(total_docs=116)
+    page.pages[1] = []
+    try:
+        _collect(page, max_docs=1000)
+    except RuntimeError as exc:
+        assert "no document rows" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError on empty results page")
