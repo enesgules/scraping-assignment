@@ -97,9 +97,16 @@ async (caseNumber) => {{
   const html = await resp.text();
   const dom = new DOMParser().parseFromString(html, 'text/html');
   const docs = ({_DOC_ROWS})(dom);
+  // The server renders results from per-session state, so searches running
+  // concurrently in one session cross-contaminate: the response can carry
+  // ANOTHER case's rows (verified live: 6/10 wrong at 10 concurrent). Rows
+  // name their case, so a foreign response is detectable. Searches must stay
+  // serial per session; this flag turns a violation into a retry instead of
+  // silently filing another case's documents under our case number.
+  const foreign = docs.some(d => d.caseNumber !== caseNumber);
   // Only a found case ships its HTML back over the CDP bridge — empty-case
   // probes dominate and nobody reads their redisplayed-form page.
-  return {{ok: resp.ok, searchForm: !!dom.querySelector('#CaseNumber'),
+  return {{ok: resp.ok, foreign, searchForm: !!dom.querySelector('#CaseNumber'),
           html: docs.length ? html : '', docs, pages: ({_PAGE_NUMS})(dom)}};
 }}
 """
@@ -244,10 +251,18 @@ class LosAngelesScraper(TrialScraper):
                 )
             await page.wait_for_selector("#CaseNumber", timeout=15000)
             result = await page.evaluate(_SEARCH_FETCH, case_number)
-            if result["ok"] and (result["docs"] or result["searchForm"]):
+            if (
+                result["ok"]
+                and not result["foreign"]
+                and (result["docs"] or result["searchForm"])
+            ):
                 return result["docs"], result["html"], result["pages"]
-            # Expired token/session or WAF hiccup — worth one fresh retry.
-            raise RuntimeError(f"unexpected search response (ok={result['ok']})")
+            # Expired token/session, WAF hiccup, or a contaminated response
+            # carrying another case's rows — worth one fresh retry.
+            raise RuntimeError(
+                f"unexpected search response "
+                f"(ok={result['ok']}, foreign={result['foreign']})"
+            )
 
         try:
             return await attempt()
