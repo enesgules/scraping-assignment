@@ -43,11 +43,11 @@ Optional env knobs:
 - `BROWSERBASE_CONCURRENCY` — parallel browser sessions probing/scraping
   cases; one worker per session (default `16`). Every session also runs 3
   preview tabs of a shared download pool, so a case's documents solve their
-  captchas across all sessions at once. `16` is the measured sweet spot —
-  throughput rises to ~24 docs/min there, then *drops* at 25 (~75 concurrent
-  captchas overwhelm Browserbase's solver, so downloads start failing). Keep it
-  at or below your plan's concurrent-browser limit (Developer `25`, Startup
-  `100`).
+  captchas across all sessions at once. `16` is the efficiency knee: measured
+  throughput scales ~linearly to there (~44 docs/min) then flattens (25 sessions
+  reach only ~46 for +56% cost), so past 16 you mostly pay for idle capacity.
+  Keep it at or below your plan's concurrent-browser limit (Developer `25`,
+  Startup `100`).
 
 ## How it works
 

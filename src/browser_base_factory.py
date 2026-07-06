@@ -145,7 +145,8 @@ class BrowserBaseFactory:
         # max_sessions = how many parallel browser sessions the scraper runs
         # (one per worker). Keep it at or below your plan's concurrent-browser
         # limit (Developer 25, Startup 100); the default 16 is the measured
-        # throughput sweet spot. Set via BROWSERBASE_CONCURRENCY.
+        # efficiency knee (throughput flattens past it). Set via
+        # BROWSERBASE_CONCURRENCY.
         self.max_sessions = max_sessions
         self._api_key = api_key
         self._project_id = project_id

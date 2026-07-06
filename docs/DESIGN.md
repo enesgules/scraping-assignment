@@ -63,18 +63,24 @@ session cap was set below the worker count; collapsing them removed that).
 ### How the knobs interact
 
 - **Throughput ≈ sessions × `_TABS_PER_SESSION` captchas in flight** (16 × 3 = 48
-  at the default). More sessions means more docs/min — but only up to a point:
-  past ~16 the solver saturates and reliability drops. Measured:
+  at the default). More sessions means more docs/min, with diminishing returns
+  past ~16. Measured on the current code over a fixed 120-doc workload:
 
-  | Sessions | Throughput | Reliability |
-  | --- | --- | --- |
-  | 8 | 20.6 docs/min | fine |
-  | **16** | **23.7 docs/min** | fine |
-  | 25 | 16.0 docs/min | ~11% of docs failed |
+  | Sessions | Throughput | Per session | Failures |
+  | --- | --- | --- | --- |
+  | 8 | 23.4 docs/min | 2.9 | 0 |
+  | **16** | **43.9 docs/min** | 2.7 | 0 |
+  | 25 | 46.0 docs/min | 1.8 | 0 |
 
-  Sessions are billed per minute, so past the sweet spot you also pay more for
-  less. Keep this at or below your plan's concurrent-browser limit (Developer
-  25, Startup 100); 16 is both the sweet spot and safely under Developer's cap.
+  8→16 scales nearly linearly; 16→25 is flat (+56% sessions for ~5% throughput),
+  and sessions are billed per minute, so past 16 you mostly pay for idle
+  capacity. **16 is the efficiency knee**, not a reliability ceiling — pooled
+  downloads (§7) removed the old solver-overload failures, so 25 now runs at
+  100% too, just less efficiently. Keep this at or below your plan's
+  concurrent-browser limit (Developer 25, Startup 100). *(Caveat: one run per
+  level; at 25 sessions the 12-case workload leaves ~13 sessions as
+  download-only pool muscle, so it measures ~75 concurrent download tabs, not 25
+  actively-probing workers.)*
 - **Sessions cap cases in flight, not `LA_MAX_CASES`.** A worker handles one case
   at a time; `LA_MAX_CASES` only says when to stop claiming new ones.
 - **A quota smaller than the session count doesn't waste sessions.** A worker

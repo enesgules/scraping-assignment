@@ -43,8 +43,9 @@ def main():
                 project_id=require_env("BROWSERBASE_PROJECT_ID"),
                 api_key=require_env("BROWSERBASE_API_KEY"),
                 # Parallel browser sessions = workers. Default 16 (measured
-                # throughput sweet spot); keep it at or below your plan's
-                # concurrent-browser limit (Developer 25, Startup 100).
+                # efficiency knee — throughput flattens past it); keep it at or
+                # below your plan's concurrent-browser limit (Developer 25,
+                # Startup 100).
                 max_sessions=int(os.environ.get("BROWSERBASE_CONCURRENCY", "16")),
             ),
             scrapers=[LosAngelesScraper],

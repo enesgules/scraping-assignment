@@ -197,9 +197,11 @@ class LosAngelesScraper(TrialScraper):
         # muscle (one case's 60 docs solve across 4 sessions, not 1).
         # One worker per browser session; the factory's session limit IS the
         # concurrency (each worker holds exactly one session, so demand can
-        # never exceed supply). Measured sweet spot ~16: throughput rose 8->16
-        # (20.6->23.7 docs/min) then FELL at 25 (16.0, 11% of docs failed) as
-        # ~75 concurrent captchas overload the solver.
+        # never exceed supply). 16 is the efficiency knee: measured on a fixed
+        # 120-doc workload, throughput scaled ~linearly 8->16 (23->44 docs/min,
+        # 0 failures) then flattened 16->25 (44->46, still 0 failures) — past 16
+        # you pay for sessions that barely add throughput. (No reliability cliff
+        # at 25 anymore; pooled downloads removed the old solver-overload one.)
         workers = self.browser.max_sessions
         docs_label = "all" if self.max_docs == sys.maxsize else self.max_docs
         log(
