@@ -1,31 +1,24 @@
 from dataclasses import dataclass
 from datetime import date
 
-from ..ports import BrowserBaseFactory
-from ..models import TrialScraper, ScrapedTrialCase
+from ..browser_base_factory import BrowserBaseFactory
+from ..case_store import CaseStore
+from ..models import TrialScraper
 
 
 @dataclass
 class ScrapingPipelineDeps:
-    broswer_base: BrowserBaseFactory
+    browser_base: BrowserBaseFactory
     scrapers: list[type[TrialScraper]]
 
 
 def create_scraping_pipeline(deps: ScrapingPipelineDeps):
     async def scraping_pipeline(to_date: date, from_date: date):
-        async def insert_case(case: ScrapedTrialCase):
-            doc_names = ", ".join(d.document_name for d in case.document_list[:3])
-            suffix = (
-                f" +{len(case.document_list) - 3} more"
-                if len(case.document_list) > 3
-                else ""
-            )
-            print(
-                f"[{case.case_number}] {case.court_name} — {len(case.document_list)} doc(s): {doc_names}{suffix}"
-            )
-
+        # One store per run — it accumulates this run's cases/failures. The
+        # scrapers write to its insert_case / record_failure sinks.
+        store = CaseStore()
         for Scraper in deps.scrapers:
-            scraper = Scraper(to_date, from_date)
-            await scraper.scrape(insert_case)
+            scraper = Scraper(to_date, from_date, deps.browser_base)
+            await scraper.scrape(store.insert_case, store.record_failure)
 
     return scraping_pipeline

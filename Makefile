@@ -1,4 +1,4 @@
-.PHONY: install format lint lint-fix typecheck validate
+.PHONY: install format lint lint-fix typecheck test validate
 
 install:
 	uv sync
@@ -15,4 +15,7 @@ lint-fix:
 typecheck:
 	uv run --with pyright pyright .
 
-validate: format lint typecheck
+test:
+	uv run pytest tests/
+
+validate: format lint typecheck test
