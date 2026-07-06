@@ -3,12 +3,14 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from typing import cast
 
 from playwright.async_api import Page
 
+from src.browser_base_factory import BrowserBaseFactory
 from src.ports.los_angeles_scraper import (
+    LosAngelesScraper,
     _case_meta,
     _collect_all_documents,
     _doc_id_in,
@@ -53,6 +55,41 @@ def test_is_complete_pdf():
     assert not _is_complete_pdf(b"%PDF-1.7 cut off mid-stream")  # no trailer
     assert not _is_complete_pdf(b"<html>error page</html>")
     assert not _is_complete_pdf(b"")
+
+
+def test_download_pool_resubmits_failed_doc():
+    """A doc whose job resolves None (preview never started, bad capture, …)
+    is resubmitted once and can succeed on the second pass."""
+
+    async def run():
+        scraper = LosAngelesScraper(
+            date(2019, 12, 31), date(2019, 1, 1), cast(BrowserBaseFactory, None)
+        )
+        pdf = b"%PDF ok %%EOF"
+        failures = {"2": 1}  # docId -> jobs that resolve None before succeeding
+
+        async def consumer():
+            while True:
+                doc, fut = await scraper._dl_queue.get()
+                if failures.get(doc["docId"], 0) > 0:
+                    failures[doc["docId"]] -= 1
+                    fut.set_result(None)
+                else:
+                    fut.set_result(pdf)
+
+        task = asyncio.create_task(consumer())
+        selected = [
+            {"docId": "1", "description": "a", "caseNumber": "X"},
+            {"docId": "2", "description": "b", "caseNumber": "X"},
+        ]
+        try:
+            got = await scraper._download_documents("X", selected)
+        finally:
+            task.cancel()
+        assert got == {"1": pdf, "2": pdf}  # doc 2 recovered on resubmission
+        assert failures["2"] == 0
+
+    asyncio.run(run())
 
 
 def test_parse_date():

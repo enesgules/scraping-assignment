@@ -114,10 +114,11 @@ async (caseNumber) => {{
 
 _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 
-# Global ceiling on captcha-gated downloads in flight at once, across every
-# worker and case. Without it, a big case (up to 50 docs) times LA_CONCURRENCY
-# sessions opens hundreds of simultaneous previews and melts down.
-_MAX_CONCURRENT_DOWNLOADS = 24
+# Preview tabs per worker session serving the shared download pool. Sized to
+# the captcha solver's per-session appetite (~2-4 concurrent solves, measured
+# live); more tabs would just queue behind the solver. The global ceiling on
+# captcha-gated previews is structural: _TABS_PER_SESSION x workers.
+_TABS_PER_SESSION = 3
 
 
 class LosAngelesScraper(TrialScraper):
@@ -145,8 +146,12 @@ class LosAngelesScraper(TrialScraper):
         self._scraped = 0  # cases with >=1 document saved
         self._docs_saved = 0
         self._docs_failed = 0  # docs found but not captured
-        # Caps concurrent downloads across all workers (see constant above).
-        self._dl_sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+        # Shared download pool: any worker session's consumers execute any
+        # case's preview jobs (securityKeys are session-independent), so one
+        # case's captchas solve across ALL sessions at once.
+        self._dl_queue: asyncio.Queue[
+            tuple[dict[str, str], asyncio.Future[bytes | None]]
+        ] = asyncio.Queue()
 
     async def scrape(self, insert_case: InsertCase) -> None:
         # No point opening more sessions than explicit case numbers to search.
@@ -188,38 +193,50 @@ class LosAngelesScraper(TrialScraper):
         bb = self.browser.new_browser_base()
         async with bb as (_session, page):
             await self._continue_as_guest(page)
-            for case_number in case_iter:
-                if self._claimed >= self.max_cases:
-                    return  # quota already claimed (by any worker)
-                self._attempted += 1
-                try:
-                    print(f"[{case_number}] checking for documents…")
-                    docs, html, pages = await self._search(page, case_number)
-                except Exception as exc:  # one bad case must not kill the sweep
-                    print(f"[{case_number}] error, skipping: {exc!r}")
-                    continue
-                if not docs:
-                    print(f"[{case_number}] no documents")
-                    continue
-                # Claim a slot *before* the expensive download-scrape so no
-                # worker downloads a case beyond the quota.
-                if self._claimed >= self.max_cases:
-                    return
-                self._claimed += 1
-                print(f"[{case_number}] found documents — downloading")
-                try:
-                    case = await self._scrape_case(
-                        page, bb, case_number, docs, html, pages
-                    )
-                except Exception as exc:
-                    print(f"[{case_number}] error, skipping: {exc!r}")
-                    self._claimed -= 1  # slot didn't pan out; free it
-                    continue
-                if case is None:
-                    self._claimed -= 1
-                    continue
-                self._scraped += 1
-                await insert_case(case)
+            # This session's share of the download pool (see _download_documents).
+            consumers = [
+                asyncio.create_task(self._consume(bb, page))
+                for _ in range(_TABS_PER_SESSION)
+            ]
+            try:
+                for case_number in case_iter:
+                    if self._claimed >= self.max_cases:
+                        return  # quota already claimed (by any worker)
+                    self._attempted += 1
+                    try:
+                        print(f"[{case_number}] checking for documents…")
+                        docs, html, pages = await self._search(page, case_number)
+                    except Exception as exc:  # a bad case must not kill the sweep
+                        print(f"[{case_number}] error, skipping: {exc!r}")
+                        continue
+                    if not docs:
+                        print(f"[{case_number}] no documents")
+                        continue
+                    # Claim a slot *before* the expensive download-scrape so no
+                    # worker downloads a case beyond the quota.
+                    if self._claimed >= self.max_cases:
+                        return
+                    self._claimed += 1
+                    print(f"[{case_number}] found documents — downloading")
+                    try:
+                        case = await self._scrape_case(
+                            page, case_number, docs, html, pages
+                        )
+                    except Exception as exc:
+                        print(f"[{case_number}] error, skipping: {exc!r}")
+                        self._claimed -= 1  # slot didn't pan out; free it
+                        continue
+                    if case is None:
+                        self._claimed -= 1
+                        continue
+                    self._scraped += 1
+                    await insert_case(case)
+            finally:
+                # Cancelled consumers hand any in-flight job back to the queue,
+                # so a worker retiring early never strands another case's doc.
+                for c in consumers:
+                    c.cancel()
+                await asyncio.gather(*consumers, return_exceptions=True)
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -274,7 +291,6 @@ class LosAngelesScraper(TrialScraper):
     async def _scrape_case(
         self,
         page: Page,
-        bb: BrowserBase,
         case_number: str,
         docs: list[dict[str, str]],
         html: str,
@@ -282,6 +298,8 @@ class LosAngelesScraper(TrialScraper):
     ) -> ScrapedTrialCase | None:
         # docs/html/pages come from the probe search in this same session — no
         # re-search. html is the page-1 results HTML; it carries case metadata.
+        # Pagination MUST happen here, in the session that searched (the server
+        # holds the current case per session); downloads then go to the pool.
         docs = await _collect_all_documents(page, docs, self.max_docs, pages)
         selected = docs[: self.max_docs]
         print(
@@ -289,7 +307,7 @@ class LosAngelesScraper(TrialScraper):
             f"downloading {len(selected)}"
         )
 
-        pdf_by_id = await self._download_documents(page, bb, case_number, selected)
+        pdf_by_id = await self._download_documents(case_number, selected)
 
         documents: list[ScrapedTrialDocument] = []
         for d in selected:
@@ -334,59 +352,27 @@ class LosAngelesScraper(TrialScraper):
         )
 
     async def _download_documents(
-        self,
-        page: Page,
-        bb: BrowserBase,
-        case_number: str,
-        selected: list[dict[str, str]],
+        self, case_number: str, selected: list[dict[str, str]]
     ) -> dict[str, bytes]:
-        """Download every selected doc and return {docId: pdf_bytes}.
-
-        Each doc previews in its own tab (bounded by _dl_sem). The browser's
-        CDP download events say exactly when each PDF has fully transferred —
-        its tab closes that instant — and each file is then fetched once via
-        the per-file downloads API. An incomplete capture is rejected and
-        retried once with a fresh preview."""
+        """Download every selected doc via the shared pool and return
+        {docId: pdf_bytes}. Each doc becomes a queue job executed by whichever
+        worker session has a free preview tab — a case's ~25s-per-doc captchas
+        solve across ALL sessions at once instead of queueing behind this
+        worker's own solver. A doc that never starts or lands incomplete is
+        resubmitted once (a fresh preview, likely on another session)."""
         got: dict[str, bytes] = {}
-
-        async def start(i: int, d: dict[str, str], tabs: dict[str, Page]) -> bool:
-            # Slot released once the download has started; the tab stays open so
-            # the PDF finishes transferring — closing early would truncate it.
-            async with self._dl_sem:  # bound concurrent captcha-gated previews
-                did = d["docId"]
-                print(
-                    f"  [{case_number}] downloading {i}/{len(selected)}: "
-                    f"{d['description']}"
-                )
-                tab = await page.context.new_page()
-                tabs[did] = tab
-                try:
-                    return await self._trigger_download(tab, d)
-                except Exception as exc:  # one doc must not sink its siblings
-                    print(f"  [{case_number}] doc {did} download failed: {exc!r}")
-                    return False
-
+        loop = asyncio.get_running_loop()
         for attempt in range(2):
-            todo = [(i, d) for i, d in enumerate(selected, 1) if d["docId"] not in got]
+            todo = [d for d in selected if d["docId"] not in got]
             if not todo:
                 break
-            tabs: dict[str, Page] = {}  # docId -> open tab, closed once its PDF lands
-            flags = await asyncio.gather(*(start(i, d, tabs) for i, d in todo))
-            started = {d["docId"] for (_, d), ok in zip(todo, flags) if ok}
-            # A started download transfers in well under a second; wait on the
-            # browser's completion events (in-memory, no network) and close
-            # each tab the moment its PDF is fully across. 30s covers a
-            # straggling multi-MB transfer.
-            for _ in range(60 if started else 0):
-                done_ids = {_doc_id_in(n) for n in bb.completed_downloads}
-                for did in [k for k in tabs if k in done_ids]:
-                    await tabs.pop(did).close()
-                if started <= done_ids:
-                    break
-                await asyncio.sleep(0.5)
-            for tab in tabs.values():  # never began/completed — retried next round
-                await tab.close()
-            got |= await self._fetch_completed(bb, started - got.keys())
+            jobs = [(d, loop.create_future()) for d in todo]
+            for job in jobs:
+                self._dl_queue.put_nowait(job)
+            for d, fut in jobs:
+                data = await fut
+                if data is not None:
+                    got[d["docId"]] = data
             if attempt == 0 and len(got) < len(selected):
                 print(
                     f"  [{case_number}] {len(selected) - len(got)} download(s) "
@@ -394,31 +380,56 @@ class LosAngelesScraper(TrialScraper):
                 )
         return got
 
-    async def _fetch_completed(
-        self, bb: BrowserBase, needed: set[str]
-    ) -> dict[str, bytes]:
-        """Fetch ``needed`` docIds' PDFs, each exactly once, via the per-file
-        downloads API. Storage sync can lag the browser's completion event by
-        a moment, so stragglers get a couple of re-lists before giving up."""
-        got: dict[str, bytes] = {}
-        rejected: set[str] = set()  # fetched but not a complete PDF
+    async def _consume(self, bb: BrowserBase, page: Page) -> None:
+        """One preview-tab slot of the download pool: pull jobs off the shared
+        queue and run them in this worker's session until cancelled (when the
+        worker retires). A job interrupted by that cancellation goes back on
+        the queue for a still-live session; any other failure resolves the job
+        with None so the submitting case can resubmit or move on."""
+        while True:
+            doc, fut = await self._dl_queue.get()
+            try:
+                fut.set_result(await self._execute_job(bb, page, doc))
+            except asyncio.CancelledError:
+                self._dl_queue.put_nowait((doc, fut))
+                raise
+            except Exception as exc:  # one doc must not kill this pool slot
+                print(f"  [{doc['caseNumber']}] doc {doc['docId']}: {exc!r}")
+                if not fut.done():
+                    fut.set_result(None)
+
+    async def _execute_job(
+        self, bb: BrowserBase, page: Page, doc: dict[str, str]
+    ) -> bytes | None:
+        """Preview one doc in a fresh tab of this session and return its PDF
+        bytes — None if the download never starts or lands incomplete."""
+        did = doc["docId"]
+        print(f"  [{doc['caseNumber']}] downloading: {doc['description']}")
+        tab = await page.context.new_page()
+        try:
+            if not await self._trigger_download(tab, doc):
+                return None
+            # The transfer finishes well under a second after it begins; wait
+            # on this session's CDP completion events (in-memory, no network)
+            # so the tab never closes mid-transfer. 30s covers a straggler.
+            for _ in range(60):
+                if did in {_doc_id_in(n) for n in bb.completed_downloads}:
+                    break
+                await asyncio.sleep(0.5)
+        finally:
+            await tab.close()
+        # Fetch the bytes once via the per-file downloads API; storage sync can
+        # lag the completion event a moment, so re-list briefly for stragglers.
         for round_ in range(3):
-            pending = needed - got.keys() - rejected
-            if not pending:
-                break
             if round_:
-                await asyncio.sleep(2)  # give storage sync a moment
+                await asyncio.sleep(2)
             files = _pick_download_files(await bb.list_download_files())
-            fetchable = [(did, files[did]) for did in pending if did in files]
-            datas = await asyncio.gather(
-                *(bb.get_download_file(f["id"]) for _, f in fetchable)
-            )
-            for (did, _), data in zip(fetchable, datas):
-                if _is_complete_pdf(data):
-                    got[did] = data
-                else:
-                    rejected.add(did)  # a fresh preview next round replaces it
-        return got
+            if did in files:
+                data = await bb.get_download_file(files[did]["id"])
+                # An incomplete capture won't heal by refetching; resubmission
+                # re-previews it fresh (largest capture then wins the pick).
+                return data if _is_complete_pdf(data) else None
+        return None
 
     async def _trigger_download(self, page: Page, doc: dict[str, str]) -> bool:
         """Open the captcha-gated Preview once and return True if Chrome starts
