@@ -54,7 +54,7 @@ _DOC_ROWS = r"""
     if (!m) return null;
     return {docId: m[1], securityKey: m[2], caseType: m[3], source: m[4],
             caseNumber: m[5], date: (tds[1]?.innerText || '').trim(),
-            description: (tds[2]?.innerText || '').trim()};
+            description: (tds[2]?.innerText || '').replace(/\s+/g, ' ').trim()};
   }).filter(Boolean);
 }
 """
@@ -95,8 +95,11 @@ async (caseNumber) => {{
   }});
   const html = await resp.text();
   const dom = new DOMParser().parseFromString(html, 'text/html');
+  const docs = ({_DOC_ROWS})(dom);
+  // Only a found case ships its HTML back over the CDP bridge — empty-case
+  // probes dominate and nobody reads their redisplayed-form page.
   return {{ok: resp.ok, searchForm: !!dom.querySelector('#CaseNumber'),
-          html, docs: ({_DOC_ROWS})(dom), pages: ({_PAGE_NUMS})(dom)}};
+          html: docs.length ? html : '', docs, pages: ({_PAGE_NUMS})(dom)}};
 }}
 """
 
@@ -128,6 +131,7 @@ class LosAngelesScraper(TrialScraper):
         # _MAX_CONCURRENT_DOWNLOADS, so more than ~4-6 workers rarely helps.
         self.concurrency = int(os.environ.get("LA_CONCURRENCY", "4"))
         self._attempted = 0
+        self._claimed = 0  # cases committed to downloading (quota gate)
         self._scraped = 0
         # Caps concurrent downloads across all workers (see constant above).
         self._dl_sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
@@ -164,27 +168,38 @@ class LosAngelesScraper(TrialScraper):
         async with bb as (_session, page):
             await self._continue_as_guest(page)
             for case_number in case_iter:
-                if self._scraped >= self.max_cases:
-                    return
+                if self._claimed >= self.max_cases:
+                    return  # quota already claimed (by any worker)
                 self._attempted += 1
+                # Probe cheaply in this shared session first.
                 try:
                     print(f"[{case_number}] checking for documents…")
                     docs, _, _ = await self._search(page, case_number)
-                    if not docs:
-                        print(f"[{case_number}] no documents")
-                        continue
-                    print(
-                        f"[{case_number}] found documents — "
-                        "opening a new browser to download them"
-                    )
-                    case = await self._scrape_case_in_session(case_number)
                 except Exception as exc:  # one bad case must not kill the sweep
                     print(f"[{case_number}] error, skipping: {exc!r}")
                     continue
-                if case is None:
+                if not docs:
+                    print(f"[{case_number}] no documents")
                     continue
-                if self._scraped >= self.max_cases:
-                    return  # another worker filled the quota mid-flight
+                # Claim a slot *before* the expensive download-scrape so no
+                # worker downloads a case beyond the quota (avoids paying for
+                # cases that would be discarded at the boundary).
+                if self._claimed >= self.max_cases:
+                    return
+                self._claimed += 1
+                print(
+                    f"[{case_number}] found documents — "
+                    "opening a new browser to download them"
+                )
+                try:
+                    case = await self._scrape_case_in_session(case_number)
+                except Exception as exc:
+                    print(f"[{case_number}] error, skipping: {exc!r}")
+                    self._claimed -= 1  # slot didn't pan out; free it
+                    continue
+                if case is None:
+                    self._claimed -= 1
+                    continue
                 self._scraped += 1
                 await insert_case(case)
 
@@ -220,27 +235,27 @@ class LosAngelesScraper(TrialScraper):
         reloads if something navigated away (pagination does) or the
         session/token went stale, in which case the guest session is
         re-established and the search retried once."""
-        for attempt in range(2):
-            try:
-                if "/DocumentImages/SearchCaseNumber" not in page.url:
-                    await page.goto(
-                        f"{BASE}/DocumentImages/SearchCaseNumber",
-                        wait_until="domcontentloaded",
-                        timeout=90000,
-                    )
-                await page.wait_for_selector("#CaseNumber", timeout=15000)
-                result = await page.evaluate(_SEARCH_FETCH, case_number)
-                if result["ok"] and (result["docs"] or result["searchForm"]):
-                    return result["docs"], result["html"], result["pages"]
-                raise RuntimeError(
-                    f"unexpected search response (ok={result['ok']})"
-                )  # expired token/session or WAF hiccup — retry fresh
-            except (PlaywrightError, RuntimeError) as exc:
-                if attempt:
-                    raise
-                print(f"[{case_number}] search failed, trying again: {exc!r}")
-                await self._continue_as_guest(page)  # session may have expired
-        return [], "", []  # unreachable: the second attempt returns or raises
+
+        async def attempt() -> tuple[list[dict[str, str]], str, list[int]]:
+            if "/DocumentImages/SearchCaseNumber" not in page.url:
+                await page.goto(
+                    f"{BASE}/DocumentImages/SearchCaseNumber",
+                    wait_until="domcontentloaded",
+                    timeout=90000,
+                )
+            await page.wait_for_selector("#CaseNumber", timeout=15000)
+            result = await page.evaluate(_SEARCH_FETCH, case_number)
+            if result["ok"] and (result["docs"] or result["searchForm"]):
+                return result["docs"], result["html"], result["pages"]
+            # Expired token/session or WAF hiccup — worth one fresh retry.
+            raise RuntimeError(f"unexpected search response (ok={result['ok']})")
+
+        try:
+            return await attempt()
+        except (PlaywrightError, RuntimeError) as exc:
+            print(f"[{case_number}] search failed, trying again: {exc!r}")
+            await self._continue_as_guest(page)  # session may have expired
+            return await attempt()
 
     async def _scrape_case(
         self, page: Page, bb: BrowserBase, case_number: str
@@ -313,36 +328,45 @@ class LosAngelesScraper(TrialScraper):
         one fetch per document — the cumulative session zip is fetched a handful
         of times, not once per doc. A truncated capture is rejected by
         _pdfs_by_doc_id and retried once with a fresh preview."""
-        index = {d["docId"]: i for i, d in enumerate(selected, 1)}
         got: dict[str, bytes] = {}
 
-        async def start(d: dict[str, str]) -> None:
-            async with self._dl_sem:  # cap concurrent downloads run-wide
+        async def start(i: int, d: dict[str, str], tabs: dict[str, Page]) -> bool:
+            # Slot released once the download has started; the tab stays open so
+            # the PDF finishes transferring — closing early would truncate it.
+            async with self._dl_sem:  # bound concurrent captcha-gated previews
                 did = d["docId"]
                 print(
-                    f"  [{case_number}] downloading {index[did]}/{len(selected)}: "
+                    f"  [{case_number}] downloading {i}/{len(selected)}: "
                     f"{d['description']}"
                 )
                 tab = await page.context.new_page()
+                tabs[did] = tab
                 try:
-                    if await self._trigger_download(tab, d):
-                        await tab.wait_for_timeout(2000)  # let the PDF finish
+                    return await self._trigger_download(tab, d)
                 except Exception as exc:  # one doc must not sink its siblings
                     print(f"  [{case_number}] doc {did} download failed: {exc!r}")
-                finally:
-                    await tab.close()
+                    return False
 
         for attempt in range(2):
-            todo = [d for d in selected if d["docId"] not in got]
+            todo = [(i, d) for i, d in enumerate(selected, 1) if d["docId"] not in got]
             if not todo:
                 break
-            await asyncio.gather(*(start(d) for d in todo))
-            # Confirm the whole batch from one zip fetch (retry for slow sync).
-            for _ in range(5):
+            tabs: dict[str, Page] = {}  # docId -> open tab, closed once its PDF lands
+            flags = await asyncio.gather(*(start(i, d, tabs) for i, d in todo))
+            started = {d["docId"] for (_, d), ok in zip(todo, flags) if ok}
+            # One zip fetch per poll; close each tab only once its PDF has fully
+            # landed, so nothing is cut off mid-transfer. Wait only on downloads
+            # that actually began — one that never started can't arrive, and
+            # polling for it would burn zip fetches and sleeps for nothing.
+            for _ in range(6 if started else 0):
                 got = _pdfs_by_doc_id(await bb.get_downloads())
-                if all(d["docId"] in got for d in selected):
+                for did in [k for k in tabs if k in got]:
+                    await tabs.pop(did).close()
+                if started <= got.keys():
                     break
                 await asyncio.sleep(2)
+            for tab in tabs.values():  # never arrived — retried next round
+                await tab.close()
             if attempt == 0 and len(got) < len(selected):
                 print(
                     f"  [{case_number}] {len(selected) - len(got)} download(s) "
@@ -353,7 +377,7 @@ class LosAngelesScraper(TrialScraper):
     async def _trigger_download(self, page: Page, doc: dict[str, str]) -> bool:
         """Open the captcha-gated Preview once and return True if Chrome starts
         the PDF download (False if it never starts). Browserbase solves the
-        captcha while we wait; retrying is handled by _download_document."""
+        captcha while we wait; retrying is handled by _download_documents."""
         preview_url = (
             f"{BASE}/DocumentImages/PreviewWait?id={quote(doc['docId'])}"
             f"&securityKey={quote(doc['securityKey'])}"
@@ -377,24 +401,18 @@ async def _collect_all_documents(
     page: Page,
     docs: list[dict[str, str]],
     max_docs: int,
-    page_numbers: list[int] | None = None,
+    page_numbers: list[int],
 ) -> list[dict[str, str]]:
     """Walk the results pager, returning page 1's ``docs`` plus each further
     page's documents until we have enough for max_docs or run out of pages.
     Results hold 50 docs per page; further pages are at
     SelectDocuments?page=N (the case is held in the session). ``page_numbers``
     is page 1's pager as seen by the fetch search — the live DOM is still the
-    search form at that point, so it can't be read from there."""
+    search form at that point, so it can't be read from there; after each
+    navigation the pager is reread from the newly-loaded page."""
     docs = list(docs)
     current = 1
-    while len(docs) < max_docs:
-        nums: list[int] = (
-            page_numbers
-            if page_numbers is not None
-            else await page.evaluate(_PAGE_LINKS)
-        )
-        if current + 1 not in nums:
-            break  # no next page
+    while len(docs) < max_docs and current + 1 in page_numbers:
         current += 1
         await page.goto(
             f"{BASE}/DocumentImages/SelectDocuments?page={current}",
@@ -405,7 +423,7 @@ async def _collect_all_documents(
         # sleep — a slow page must not silently truncate the document list.
         await page.wait_for_selector("input[type=checkbox][id^='Doc']", timeout=30000)
         docs += await page.evaluate(_EXTRACT_DOCS)
-        page_numbers = None  # reread the pager from the newly-loaded page
+        page_numbers = await page.evaluate(_PAGE_LINKS)
     return docs
 
 

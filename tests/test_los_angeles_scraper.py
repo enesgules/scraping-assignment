@@ -117,8 +117,9 @@ class _FakePage:
 
 
 def _collect(page: _FakePage, max_docs: int) -> list[dict[str, str]]:
+    pager = list(range(2, len(page.pages) + 1))  # page 1's pager, as _search sees it
     return asyncio.run(
-        _collect_all_documents(cast(Page, page), page.pages[0], max_docs)
+        _collect_all_documents(cast(Page, page), page.pages[0], max_docs, pager)
     )
 
 
