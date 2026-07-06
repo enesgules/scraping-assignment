@@ -80,13 +80,15 @@ class BrowserBase:
 
 
 class BrowserBaseFactory:
-    max_sessions: int = 20
-
-    def __init__(self, api_key: str, project_id: str) -> None:
+    def __init__(self, api_key: str, project_id: str, max_sessions: int = 25) -> None:
+        # max_sessions caps concurrent Browserbase sessions (their per-plan
+        # "concurrent browsers" limit). Default 25 = Developer plan; raise it
+        # via entry.py only when this key won't contend with production.
+        self.max_sessions = max_sessions
         self._api_key = api_key
         self._project_id = project_id
         self._bb = AsyncBrowserbase(api_key=self._api_key)
-        self._semaphore = asyncio.Semaphore(self.max_sessions)
+        self._semaphore = asyncio.Semaphore(max_sessions)
 
     def new_browser_base(self) -> BrowserBase:
         return BrowserBase(self._bb, self._project_id, self._semaphore)

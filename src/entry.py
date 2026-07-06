@@ -36,6 +36,10 @@ def main():
             browser_base=BrowserBaseFactory(
                 project_id=require_env("BROWSERBASE_PROJECT_ID"),
                 api_key=require_env("BROWSERBASE_API_KEY"),
+                # Cap concurrent Browserbase sessions. Default 25 (Developer
+                # plan); set to 100 for Startup only when this key is isolated
+                # from production.
+                max_sessions=int(os.environ.get("BROWSERBASE_MAX_CONCURRENCY", "25")),
             ),
             scrapers=[LosAngelesScraper],
         )
