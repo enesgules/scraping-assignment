@@ -19,8 +19,9 @@ import asyncio
 import hashlib
 import os
 import re
+import sys
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import date, datetime
 from html import unescape
 from typing import Any
@@ -137,10 +138,11 @@ class LosAngelesScraper(TrialScraper):
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
         self.max_cases = int(os.environ.get("LA_MAX_CASES", "3"))
         self.max_docs = int(os.environ.get("LA_MAX_DOCS", "10"))
-        # Worker sessions (each probes + downloads, so one Browserbase session
-        # per worker). Raise toward BROWSERBASE_MAX_CONCURRENCY for big sweeps;
-        # gains taper off once the captcha solver saturates.
-        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "8"))
+        # Worker sessions (each probes + downloads + runs pool tabs). Measured
+        # sweet spot ~16: throughput rose 8->16 (20.6->23.7 docs/min) then FELL
+        # at 25 (16.0, 11% of docs failed) as ~75 concurrent captchas overload
+        # Browserbase's solver. Past ~16 you saturate it and reliability drops.
+        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "16"))
         self._attempted = 0  # case numbers probed
         self._claimed = 0  # cases committed to downloading (quota gate)
         self._scraped = 0  # cases with >=1 document saved
@@ -152,6 +154,11 @@ class LosAngelesScraper(TrialScraper):
         self._dl_queue: asyncio.Queue[
             tuple[dict[str, str], asyncio.Future[bytes | None]]
         ] = asyncio.Queue()
+        # Workers still probing/downloading. A worker that runs out of work
+        # keeps its pool tabs alive until this hits zero, so the run's last
+        # case solves its captchas on the FULL pool, not a shrinking one.
+        self._active_workers = 0
+        self._all_workers_done = asyncio.Event()
 
     async def scrape(self, insert_case: InsertCase) -> None:
         # No point opening more sessions than explicit case numbers to search.
@@ -161,6 +168,7 @@ class LosAngelesScraper(TrialScraper):
             f"{self.max_docs} doc(s) each; opening {workers} browser session(s)…"
         )
         started = time.monotonic()
+        self._active_workers = workers
         case_iter = iter(self._target_case_numbers())
         results = await asyncio.gather(
             *(self._worker(case_iter, insert_case) for _ in range(workers)),
@@ -190,6 +198,31 @@ class LosAngelesScraper(TrialScraper):
         or the numbers run out, probing and downloading in ONE long-lived
         session so there's no fresh session (or re-search) per case. Sharing a
         plain iterator between workers is safe: next() has no await point."""
+        retired = False
+
+        def retire() -> None:
+            # Idempotent: runs in the probe loop's finally AND the outer one,
+            # so a session that dies during setup still gets counted down —
+            # otherwise every other worker would park forever below.
+            nonlocal retired
+            if retired:
+                return
+            retired = True
+            self._active_workers -= 1
+            if self._active_workers == 0:
+                self._all_workers_done.set()
+
+        try:
+            await self._worker_session(case_iter, insert_case, retire)
+        finally:
+            retire()
+
+    async def _worker_session(
+        self,
+        case_iter: Iterator[str],
+        insert_case: InsertCase,
+        retire: Callable[[], None],
+    ) -> None:
         bb = self.browser.new_browser_base()
         async with bb as (_session, page):
             await self._continue_as_guest(page)
@@ -232,11 +265,21 @@ class LosAngelesScraper(TrialScraper):
                     self._scraped += 1
                     await insert_case(case)
             finally:
-                # Cancelled consumers hand any in-flight job back to the queue,
-                # so a worker retiring early never strands another case's doc.
-                for c in consumers:
-                    c.cancel()
-                await asyncio.gather(*consumers, return_exceptions=True)
+                retire()
+                try:
+                    # Out of cases, but other workers may still be downloading:
+                    # park here so this session's pool tabs keep solving their
+                    # captchas until everyone is done. A worker whose session
+                    # just broke (exception in flight) tears down instead.
+                    if sys.exc_info()[0] is None:
+                        await self._all_workers_done.wait()
+                finally:
+                    # Cancelled consumers hand any in-flight job back to the
+                    # queue, so a worker retiring early never strands another
+                    # case's doc.
+                    for c in consumers:
+                        c.cancel()
+                    await asyncio.gather(*consumers, return_exceptions=True)
 
     def _target_case_numbers(self) -> Iterable[str]:
         return self.case_numbers or generate_case_numbers(self.from_date, self.to_date)
@@ -266,7 +309,11 @@ class LosAngelesScraper(TrialScraper):
                     wait_until="domcontentloaded",
                     timeout=90000,
                 )
-            await page.wait_for_selector("#CaseNumber", timeout=15000)
+            # No wait_for_selector here: the form is server-rendered (present
+            # at domcontentloaded), and its poller starves when sibling preview
+            # tabs monopolize the renderer — it timed out on pages that were
+            # fine, losing real cases. A genuinely missing form/token makes the
+            # fetch below report searchForm=false, which retries anyway.
             result = await page.evaluate(_SEARCH_FETCH, case_number)
             if (
                 result["ok"]
