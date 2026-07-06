@@ -37,7 +37,7 @@ def test_doc_id_in():
 def test_pdfs_by_doc_id_maps_and_skips_non_pdf():
     z = _zip(
         {
-            "e78869237(1)-1.pdf": b"%PDF-1.7 real",
+            "e78869237(1)-1.pdf": b"%PDF-1.7 real\n%%EOF",
             "notes.txt": b"not a pdf",
         }
     )
@@ -46,14 +46,20 @@ def test_pdfs_by_doc_id_maps_and_skips_non_pdf():
     assert out["78869237"].startswith(b"%PDF")
 
 
+def test_pdfs_by_doc_id_rejects_truncated():
+    # Starts with %PDF but no %%EOF trailer → a truncated capture, dropped.
+    z = _zip({"e5(1)-1.pdf": b"%PDF-1.7 cut off mid-stream"})
+    assert _pdfs_by_doc_id(z) == {}
+
+
 def test_pdfs_by_doc_id_keeps_largest_duplicate():
     z = _zip(
         {
-            "e5(1)-1.pdf": b"%PDF small",
-            "e5(2)-2.pdf": b"%PDF the larger capture wins",
+            "e5(1)-1.pdf": b"%PDF small %%EOF",
+            "e5(2)-2.pdf": b"%PDF the larger capture wins %%EOF",
         }
     )
-    assert _pdfs_by_doc_id(z)["5"] == b"%PDF the larger capture wins"
+    assert _pdfs_by_doc_id(z)["5"] == b"%PDF the larger capture wins %%EOF"
 
 
 def test_pdfs_by_doc_id_empty():
