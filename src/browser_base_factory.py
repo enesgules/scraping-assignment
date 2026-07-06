@@ -1,8 +1,9 @@
 import asyncio
 
-from browserbase import AsyncBrowserbase
+from browserbase import AsyncBrowserbase, RateLimitError
 from browserbase.types.session import Session
 from browserbase.types.session_create_params import BrowserSettings
+from browserbase.types.session_create_response import SessionCreateResponse
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 
 
@@ -25,12 +26,7 @@ class BrowserBase:
     async def __aenter__(self) -> tuple[Session, Page]:
         await self._semaphore.acquire()
         try:
-            self._bb_session = await self._bb.sessions.create(
-                project_id=self._project_id,
-                browser_settings=BrowserSettings(solve_captchas=True),
-                proxies=True,
-                api_timeout=21600,
-            )
+            self._bb_session = await self._create_session()
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.connect_over_cdp(
                 self._bb_session.connect_url
@@ -52,6 +48,24 @@ class BrowserBase:
         except BaseException:
             await self._take_down()
             raise
+
+    async def _create_session(self) -> SessionCreateResponse:
+        """Create a Browserbase session, backing off on rate limits so a worker
+        rides out a burst of 429s instead of dying. This is the outer net for
+        when the SDK's own per-call retries are exhausted under sustained load."""
+        for attempt in range(4):
+            try:
+                return await self._bb.sessions.create(
+                    project_id=self._project_id,
+                    browser_settings=BrowserSettings(solve_captchas=True),
+                    proxies=True,
+                    api_timeout=21600,
+                )
+            except RateLimitError:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(2 * 2**attempt)  # 2s, 4s, 8s
+        raise AssertionError("unreachable: loop returns or raises")
 
     async def get_downloads(self) -> bytes:
         """Zip archive of every file downloaded during this session (or b'')."""
@@ -87,7 +101,9 @@ class BrowserBaseFactory:
         self.max_sessions = max_sessions
         self._api_key = api_key
         self._project_id = project_id
-        self._bb = AsyncBrowserbase(api_key=self._api_key)
+        # max_retries: the SDK retries 429s itself with backoff + retry-after;
+        # a bigger budget rides out short bursts under high concurrency.
+        self._bb = AsyncBrowserbase(api_key=self._api_key, max_retries=5)
         self._semaphore = asyncio.Semaphore(max_sessions)
 
     def new_browser_base(self) -> BrowserBase:

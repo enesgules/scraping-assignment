@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import io
 import os
+import sys
 from datetime import date
 
 from dotenv import load_dotenv
@@ -30,6 +32,10 @@ def main():
     )
     args = parser.parse_args()
 
+    # Flush progress per line even when piped to a file (long runs otherwise
+    # look frozen while stdout block-buffers).
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)  # pyright: ignore[reportUnknownMemberType]
     load_dotenv()
     pipeline = create_scraping_pipeline(
         deps=ScrapingPipelineDeps(
