@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 from .models import ScrapedTrialCase
+from .progress import log
 
 
 class CaseStore:
@@ -42,19 +43,21 @@ class CaseStore:
         async with self._lock:
             self._cases.append(_record(case))
             _write_json_atomic(self._cases_path, self._cases)
-        print(
+        log(
             f"[{case.case_number}] saved — {len(case.document_list)} doc(s); "
-            f"{len(self._cases)} case(s) now in {self._cases_path}"
+            f"{len(self._cases)} case(s) now in {self._cases_path}",
+            "green",
         )
 
     async def record_failure(self, failure: dict[str, object]) -> None:
         async with self._lock:
             self._failures.append(failure)
             _write_json_atomic(self._failures_path, self._failures)
-        print(
+        log(
             f"[{failure.get('case_number')}] failure recorded "
             f"({failure.get('reason')}); {len(self._failures)} in "
-            f"{self._failures_path}"
+            f"{self._failures_path}",
+            "red",
         )
 
 

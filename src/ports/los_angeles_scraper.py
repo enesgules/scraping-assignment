@@ -32,6 +32,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from ..browser_base_factory import BrowserBase, BrowserBaseFactory
+from ..progress import ScrapeProgress, log
 from ..models import (
     InsertCase,
     RecordFailure,
@@ -176,6 +177,18 @@ class LosAngelesScraper(TrialScraper):
         # case solves its captchas on the FULL pool, not a shrinking one.
         self._active_workers = 0
         self._all_workers_done = asyncio.Event()
+        # Live display: overall counters bar + one transient bar per
+        # downloading case. All printing goes through progress.log so lines
+        # land above the bars.
+        self._prog = ScrapeProgress(self.max_cases)
+
+    def _status(self) -> None:
+        self._prog.status(
+            probed=self._attempted,
+            scraped=self._scraped,
+            docs_saved=self._docs_saved,
+            docs_failed=self._docs_failed,
+        )
 
     async def scrape(
         self, insert_case: InsertCase, record_failure: RecordFailure
@@ -186,38 +199,48 @@ class LosAngelesScraper(TrialScraper):
         # muscle (one case's 60 docs solve across 4 sessions, not 1).
         workers = self.concurrency
         docs_label = "all" if self.max_docs == sys.maxsize else self.max_docs
-        print(
+        log(
             f"[los_angeles] starting — up to {self.max_cases} case(s), "
             f"{docs_label} doc(s) each; opening {workers} browser session(s)…"
         )
         started = time.monotonic()
         self._active_workers = workers
         case_iter = iter(self._target_case_numbers())
-        results = await asyncio.gather(
-            *(
-                self._worker(case_iter, insert_case, record_failure)
-                for _ in range(workers)
-            ),
-            return_exceptions=True,  # one dead session must not kill the rest
-        )
-        for exc in results:
-            if isinstance(exc, BaseException):
-                print(f"[los_angeles] a browser session failed: {exc!r}")
-
-        elapsed = time.monotonic() - started
-        per_min = self._docs_saved / elapsed * 60 if elapsed else 0.0
-        per_case = elapsed / self._scraped if self._scraped else 0.0
-        total_docs = self._docs_saved + self._docs_failed
-        success = 100 * self._docs_saved / total_docs if total_docs else 100.0
-        print(
-            f"[los_angeles] done in {elapsed:.0f}s — {self._scraped} case(s), "
-            f"{self._docs_saved} doc(s) saved, {self._docs_failed} failed "
-            f"({success:.0f}% of {total_docs} attempted)"
-        )
-        print(
-            f"[los_angeles]   {per_min:.1f} docs/min · avg {per_case:.0f}s/case · "
-            f"{self._attempted} case number(s) probed"
-        )
+        interrupted = False
+        try:
+            # The context manager stops the live bars even when ^C cancels the
+            # gather, so the summary below prints on a clean screen.
+            with self._prog:
+                results = await asyncio.gather(
+                    *(
+                        self._worker(case_iter, insert_case, record_failure)
+                        for _ in range(workers)
+                    ),
+                    return_exceptions=True,  # one dead session must not kill the rest
+                )
+            for exc in results:
+                if isinstance(exc, BaseException):
+                    log(f"[los_angeles] a browser session failed: {exc!r}", "red")
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
+        finally:
+            elapsed = time.monotonic() - started
+            per_min = self._docs_saved / elapsed * 60 if elapsed else 0.0
+            per_case = elapsed / self._scraped if self._scraped else 0.0
+            total_docs = self._docs_saved + self._docs_failed
+            success = 100 * self._docs_saved / total_docs if total_docs else 100.0
+            verb = "interrupted after" if interrupted else "done in"
+            log(
+                f"[los_angeles] {verb} {elapsed:.0f}s — {self._scraped} case(s), "
+                f"{self._docs_saved} doc(s) saved, {self._docs_failed} failed "
+                f"({success:.0f}% of {total_docs} attempted)",
+                "yellow" if interrupted else "green",
+            )
+            log(
+                f"[los_angeles]   {per_min:.1f} docs/min · avg {per_case:.0f}s/case · "
+                f"{self._attempted} case number(s) probed"
+            )
 
     async def _worker(
         self,
@@ -262,27 +285,28 @@ class LosAngelesScraper(TrialScraper):
                         if self._claimed >= self.max_cases:
                             break  # quota already claimed (by any worker)
                         self._attempted += 1
+                        # Probes and misses show as counters on the overall
+                        # bar instead of one printed line each.
+                        self._status()
                         try:
-                            print(f"[{case_number}] checking for documents…")
                             docs, html, pages = await self._search(page, case_number)
                         except Exception as exc:  # a bad case must not kill the run
-                            print(f"[{case_number}] error, skipping: {exc!r}")
+                            log(f"[{case_number}] error, skipping: {exc!r}", "red")
                             continue
                         if not docs:
-                            print(f"[{case_number}] no documents")
                             continue
                         # Claim a slot *before* the expensive download-scrape so
                         # no worker downloads a case beyond the quota.
                         if self._claimed >= self.max_cases:
                             break
                         self._claimed += 1
-                        print(f"[{case_number}] found documents — downloading")
+                        log(f"[{case_number}] found documents — downloading", "cyan")
                         try:
                             case = await self._scrape_case(
                                 page, case_number, docs, html, pages, record_failure
                             )
                         except Exception as exc:
-                            print(f"[{case_number}] error, skipping: {exc!r}")
+                            log(f"[{case_number}] error, skipping: {exc!r}", "red")
                             # The case is known to have documents; leave a
                             # record so a later run can retry the whole case.
                             await record_failure(
@@ -297,6 +321,7 @@ class LosAngelesScraper(TrialScraper):
                             self._claimed -= 1
                             continue
                         self._scraped += 1
+                        self._status()
                         await insert_case(case)
                     # Out of work: count down, then park so this session's pool
                     # tabs keep solving other workers' captchas until all done.
@@ -363,7 +388,7 @@ class LosAngelesScraper(TrialScraper):
         try:
             return await attempt()
         except (PlaywrightError, RuntimeError) as exc:
-            print(f"[{case_number}] search failed, trying again: {exc!r}")
+            log(f"[{case_number}] search failed, trying again: {exc!r}", "yellow")
             await self._continue_as_guest(page)  # session may have expired
             return await attempt()
 
@@ -382,7 +407,7 @@ class LosAngelesScraper(TrialScraper):
         # holds the current case per session); downloads then go to the pool.
         docs = await _collect_all_documents(page, docs, self.max_docs, pages)
         selected = docs[: self.max_docs]
-        print(
+        log(
             f"[{case_number}] {len(docs)} document(s) found; "
             f"downloading {len(selected)}"
         )
@@ -393,9 +418,10 @@ class LosAngelesScraper(TrialScraper):
         for d in selected:
             raw = pdf_by_id.get(d["docId"])
             if raw is None:
-                print(
+                log(
                     f"  [{case_number}] doc {d['docId']} could not be "
-                    "downloaded — skipping it"
+                    "downloaded — skipping it",
+                    "red",
                 )
                 # The DocRow carries everything a later run needs to refetch.
                 await record_failure(
@@ -404,9 +430,10 @@ class LosAngelesScraper(TrialScraper):
                 continue
             docket_date = _parse_date(d["date"])
             if docket_date is None:
-                print(
+                log(
                     f"  [{case_number}] doc {d['docId']} has an unreadable "
-                    f"date {d['date']!r} — skipping it"
+                    f"date {d['date']!r} — skipping it",
+                    "yellow",
                 )
                 await record_failure(
                     {"case_number": case_number, "reason": "unreadable date", **d}
@@ -425,6 +452,7 @@ class LosAngelesScraper(TrialScraper):
 
         self._docs_saved += len(documents)
         self._docs_failed += len(selected) - len(documents)
+        self._status()
 
         if not documents:
             return None
@@ -449,22 +477,28 @@ class LosAngelesScraper(TrialScraper):
         resubmitted once (a fresh preview, likely on another session)."""
         got: dict[str, bytes] = {}
         loop = asyncio.get_running_loop()
-        for attempt in range(2):
-            todo = [d for d in selected if d["docId"] not in got]
-            if not todo:
-                break
-            jobs = [(d, loop.create_future()) for d in todo]
-            for job in jobs:
-                self._dl_queue.put_nowait(job)
-            for d, fut in jobs:
-                data = await fut
-                if data is not None:
-                    got[d["docId"]] = data
-            if attempt == 0 and len(got) < len(selected):
-                print(
-                    f"  [{case_number}] {len(selected) - len(got)} download(s) "
-                    "did not arrive — trying those again"
-                )
+        task = self._prog.start_case(case_number, len(selected))
+        try:
+            for attempt in range(2):
+                todo = [d for d in selected if d["docId"] not in got]
+                if not todo:
+                    break
+                jobs = [(d, loop.create_future()) for d in todo]
+                for job in jobs:
+                    self._dl_queue.put_nowait(job)
+                for d, fut in jobs:
+                    data = await fut
+                    if data is not None:
+                        got[d["docId"]] = data
+                        self._prog.doc_done(task)
+                if attempt == 0 and len(got) < len(selected):
+                    log(
+                        f"  [{case_number}] {len(selected) - len(got)} download(s) "
+                        "did not arrive — trying those again",
+                        "yellow",
+                    )
+        finally:
+            self._prog.end_case(task)
         return got
 
     async def _consume(self, bb: BrowserBase, page: Page) -> None:
@@ -481,7 +515,7 @@ class LosAngelesScraper(TrialScraper):
                 self._dl_queue.put_nowait((doc, fut))
                 raise
             except Exception as exc:  # one doc must not kill this pool slot
-                print(f"  [{doc['caseNumber']}] doc {doc['docId']}: {exc!r}")
+                log(f"  [{doc['caseNumber']}] doc {doc['docId']}: {exc!r}", "red")
                 if not fut.done():
                     fut.set_result(None)
 
@@ -491,7 +525,7 @@ class LosAngelesScraper(TrialScraper):
         """Preview one doc in a fresh tab of this session and return its PDF
         bytes — None if the download never starts or lands incomplete."""
         did = doc["docId"]
-        print(f"  [{doc['caseNumber']}] downloading: {doc['description']}")
+        # No per-doc line here — the case's progress bar carries this now.
         tab = await page.context.new_page()
         try:
             if not await self._trigger_download(tab, doc):

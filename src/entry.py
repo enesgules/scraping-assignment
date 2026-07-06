@@ -50,4 +50,11 @@ def main():
             scrapers=[LosAngelesScraper],
         )
     )
-    asyncio.run(pipeline(to_date=args.to_date, from_date=args.from_date))
+    try:
+        asyncio.run(pipeline(to_date=args.to_date, from_date=args.from_date))
+    except KeyboardInterrupt:
+        # asyncio.run already cancelled the workers and closed the Browserbase
+        # sessions on the way out; the partial-run summary printed from the
+        # scraper's finally block. Just don't dump the traceback.
+        print("interrupted — browser sessions closed", file=sys.stderr)
+        raise SystemExit(130)
