@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -8,8 +7,8 @@ from pathlib import Path
 from ..browser_base_factory import BrowserBaseFactory
 from ..models import ScrapedTrialCase, TrialScraper
 
-# Where scraped cases are persisted. Override with LA_DB_PATH.
-DB_PATH = Path(os.environ.get("LA_DB_PATH", "cases.json"))
+# Where scraped cases are persisted.
+DB_PATH = Path("cases.json")
 
 
 @dataclass
