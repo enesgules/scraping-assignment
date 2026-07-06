@@ -20,12 +20,9 @@ class BrowserBase:
     Returns (bb_session, page) on entry; caller handles all navigation and logic.
     """
 
-    def __init__(
-        self, bb: AsyncBrowserbase, project_id: str, semaphore: asyncio.Semaphore
-    ) -> None:
+    def __init__(self, bb: AsyncBrowserbase, project_id: str) -> None:
         self._bb = bb
         self._project_id = project_id
-        self._semaphore = semaphore
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
         self._bb_session: Session | None = None
@@ -41,7 +38,6 @@ class BrowserBase:
         self.completed_downloads: set[str] = set()
 
     async def __aenter__(self) -> tuple[Session, Page]:
-        await self._semaphore.acquire()
         try:
             t0 = time.monotonic()
             self._bb_session = await self._create_session()
@@ -93,6 +89,8 @@ class BrowserBase:
                     project_id=self._project_id,
                     browser_settings=BrowserSettings(solve_captchas=True),
                     proxies=True,
+                    # Max session lifetime (6h), so Browserbase can't reap a
+                    # session mid-run during a long full-sweep scrape.
                     api_timeout=21600,
                 )
             except RateLimitError:
@@ -140,21 +138,20 @@ class BrowserBase:
         self._pw = None
         self._bb_session = None
         self._http = None
-        self._semaphore.release()
 
 
 class BrowserBaseFactory:
-    def __init__(self, api_key: str, project_id: str, max_sessions: int = 25) -> None:
-        # max_sessions caps concurrent Browserbase sessions (their per-plan
-        # "concurrent browsers" limit). Default 25 = Developer plan; raise it
-        # via entry.py only when this key won't contend with production.
+    def __init__(self, api_key: str, project_id: str, max_sessions: int = 16) -> None:
+        # max_sessions = how many parallel browser sessions the scraper runs
+        # (one per worker). Keep it at or below your plan's concurrent-browser
+        # limit (Developer 25, Startup 100); the default 16 is the measured
+        # throughput sweet spot. Set via BROWSERBASE_CONCURRENCY.
         self.max_sessions = max_sessions
         self._api_key = api_key
         self._project_id = project_id
         # max_retries: the SDK retries 429s itself with backoff + retry-after;
         # a bigger budget rides out short bursts under high concurrency.
         self._bb = AsyncBrowserbase(api_key=self._api_key, max_retries=5)
-        self._semaphore = asyncio.Semaphore(max_sessions)
 
     def new_browser_base(self) -> BrowserBase:
-        return BrowserBase(self._bb, self._project_id, self._semaphore)
+        return BrowserBase(self._bb, self._project_id)

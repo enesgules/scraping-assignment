@@ -131,10 +131,13 @@ async (caseNumber) => {{
 
 _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 
-# Preview tabs per worker session serving the shared download pool. Sized to
-# the captcha solver's per-session appetite (~2-4 concurrent solves, measured
-# live); more tabs would just queue behind the solver. The global ceiling on
-# captcha-gated previews is structural: _TABS_PER_SESSION x workers.
+# Preview tabs per worker session serving the shared download pool. Per-session
+# throughput saturates fast: measured live, 3->6 tabs at 4 sessions moved
+# throughput only 20.8->22.6 docs/min (within run-to-run noise) with more
+# resubmits. The extra tabs likely queue behind a per-session bottleneck (the
+# solver or the shared proxy pipe — not isolated), so the gain isn't worth a
+# fourth tab. The global ceiling on
+# captcha-gated previews is structural: _TABS_PER_SESSION x sessions.
 _TABS_PER_SESSION = 3
 
 
@@ -156,11 +159,6 @@ class LosAngelesScraper(TrialScraper):
         # 0 / unset = every document in the case: sys.maxsize makes the
         # len(docs) < cap comparison and the docs[:cap] slice both just work.
         self.max_docs = int(os.environ.get("LA_MAX_DOCS", "0")) or sys.maxsize
-        # Worker sessions (each probes + downloads + runs pool tabs). Measured
-        # sweet spot ~16: throughput rose 8->16 (20.6->23.7 docs/min) then FELL
-        # at 25 (16.0, 11% of docs failed) as ~75 concurrent captchas overload
-        # Browserbase's solver. Past ~16 you saturate it and reliability drops.
-        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "16"))
         self._attempted = 0  # case numbers probed
         self._claimed = 0  # cases committed to downloading (quota gate)
         self._scraped = 0  # cases with >=1 document saved
@@ -197,7 +195,12 @@ class LosAngelesScraper(TrialScraper):
         # numbers than workers: a worker with nothing left to probe parks and
         # its pool tabs keep solving, so extra sessions are download-only
         # muscle (one case's 60 docs solve across 4 sessions, not 1).
-        workers = self.concurrency
+        # One worker per browser session; the factory's session limit IS the
+        # concurrency (each worker holds exactly one session, so demand can
+        # never exceed supply). Measured sweet spot ~16: throughput rose 8->16
+        # (20.6->23.7 docs/min) then FELL at 25 (16.0, 11% of docs failed) as
+        # ~75 concurrent captchas overload the solver.
+        workers = self.browser.max_sessions
         docs_label = "all" if self.max_docs == sys.maxsize else self.max_docs
         log(
             f"[los_angeles] starting — up to {self.max_cases} case(s), "
@@ -592,6 +595,12 @@ class LosAngelesScraper(TrialScraper):
             f"&source={quote(doc['source'])}&caseType={quote(doc['caseType'])}"
             f"&caseNumber={quote(doc['caseNumber'])}"
         )
+        # 120s ceiling on preview->download. Observed solves this session were
+        # usually sub-second, occasionally ~20s (via Browserbase's
+        # browserbase-solving-finished console event), so 120s is generous
+        # headroom — but it's also what a silently-stalled preview burns before
+        # _download_documents resubmits it, so it may be reducible. Left
+        # conservative pending a wider sample.
         try:
             async with page.expect_download(timeout=120000):
                 try:

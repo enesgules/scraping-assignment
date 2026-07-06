@@ -42,10 +42,10 @@ def main():
             browser_base=BrowserBaseFactory(
                 project_id=require_env("BROWSERBASE_PROJECT_ID"),
                 api_key=require_env("BROWSERBASE_API_KEY"),
-                # Cap concurrent Browserbase sessions. Default 25 (Developer
-                # plan); set to 100 for Startup only when this key is isolated
-                # from production.
-                max_sessions=int(os.environ.get("BROWSERBASE_MAX_CONCURRENCY", "25")),
+                # Parallel browser sessions = workers. Default 16 (measured
+                # throughput sweet spot); keep it at or below your plan's
+                # concurrent-browser limit (Developer 25, Startup 100).
+                max_sessions=int(os.environ.get("BROWSERBASE_CONCURRENCY", "16")),
             ),
             scrapers=[LosAngelesScraper],
         )

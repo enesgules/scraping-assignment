@@ -52,32 +52,39 @@ Browserbase rents real Chrome browsers in the cloud. The vocabulary:
 | `LA_CASE_NUMBERS` | *(empty)* | Explicit case numbers, skipping enumeration. Handy for a demo. |
 | `LA_MAX_CASES` | 50 | Stop after this many cases yield documents. |
 | `LA_MAX_DOCS` | 0 (= all) | Documents per case; `0` means all. |
-| `LA_CONCURRENCY` | 16 | Worker sessions in parallel. The main throughput dial. |
-| `BROWSERBASE_MAX_CONCURRENCY` | 25 | Ceiling on live sessions, matching your plan. |
+| `BROWSERBASE_CONCURRENCY` | 16 | Parallel browser sessions = workers. The main throughput dial. |
 | `_TABS_PER_SESSION` (constant) | 3 | Download tabs per session for the shared pool. |
+
+There is **one** concurrency number. Each worker owns exactly one browser
+session, so the session count and the worker count are the same thing — no
+separate cap to keep in sync (an earlier two-knob version could deadlock if the
+session cap was set below the worker count; collapsing them removed that).
 
 ### How the knobs interact
 
-- **Throughput ≈ `LA_CONCURRENCY` × `_TABS_PER_SESSION` captchas in flight** (16
-  × 3 = 48 at the default). More sessions means more docs/min — but only up to a
-  point: past ~16 sessions the solver saturates and reliability drops. Measured:
+- **Throughput ≈ sessions × `_TABS_PER_SESSION` captchas in flight** (16 × 3 = 48
+  at the default). More sessions means more docs/min — but only up to a point:
+  past ~16 the solver saturates and reliability drops. Measured:
 
-  | `LA_CONCURRENCY` | Throughput | Reliability |
+  | Sessions | Throughput | Reliability |
   | --- | --- | --- |
   | 8 | 20.6 docs/min | fine |
   | **16** | **23.7 docs/min** | fine |
   | 25 | 16.0 docs/min | ~11% of docs failed |
 
   Sessions are billed per minute, so past the sweet spot you also pay more for
-  less. 16 is the default for both reasons.
-- **`LA_CONCURRENCY` caps cases in flight, not `LA_MAX_CASES`.** A worker
-  handles one case at a time; `LA_MAX_CASES` only says when to stop claiming new
-  ones.
-- **A quota smaller than the worker count doesn't waste workers.** A worker with
-  nothing to claim parks, and its 3 pool tabs keep solving captchas for the
-  claimed cases — extra workers become download-only muscle.
-- **`BROWSERBASE_MAX_CONCURRENCY` should be ≥ `LA_CONCURRENCY`**, or the extra
-  workers block waiting for a session slot.
+  less. Keep this at or below your plan's concurrent-browser limit (Developer
+  25, Startup 100); 16 is both the sweet spot and safely under Developer's cap.
+- **Sessions cap cases in flight, not `LA_MAX_CASES`.** A worker handles one case
+  at a time; `LA_MAX_CASES` only says when to stop claiming new ones.
+- **A quota smaller than the session count doesn't waste sessions.** A worker
+  with nothing to claim parks, and its 3 pool tabs keep solving captchas for the
+  claimed cases — extra sessions become download-only muscle.
+- **Raising `_TABS_PER_SESSION` barely helps** (measured: 3→6 tabs at 4 sessions
+  moved throughput only 20.8→22.6 docs/min, within run-to-run noise, with more
+  resubmits). Per-session throughput saturates fast — the extra tabs likely
+  queue behind a per-session bottleneck (the solver or the shared proxy pipe; we
+  didn't isolate which) — so it stays a constant at 3.
 
 ---
 
