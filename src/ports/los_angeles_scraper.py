@@ -134,9 +134,10 @@ class LosAngelesScraper(TrialScraper):
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
         self.max_cases = int(os.environ.get("LA_MAX_CASES", "3"))
         self.max_docs = int(os.environ.get("LA_MAX_DOCS", "10"))
-        # Worker sessions. Downloads are globally capped at
-        # _MAX_CONCURRENT_DOWNLOADS, so more than ~4-6 workers rarely helps.
-        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "4"))
+        # Worker sessions (each probes + downloads, so one Browserbase session
+        # per worker). Raise toward BROWSERBASE_MAX_CONCURRENCY for big sweeps;
+        # gains taper off once the captcha solver saturates.
+        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "8"))
         self._attempted = 0
         self._claimed = 0  # cases committed to downloading (quota gate)
         self._scraped = 0

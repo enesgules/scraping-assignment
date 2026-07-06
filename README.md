@@ -40,7 +40,9 @@ Optional env knobs:
 - `LA_MAX_CASES` — stop after this many cases yield documents (default `3`).
 - `LA_MAX_DOCS` — documents downloaded per case (default `10`).
 - `LA_CONCURRENCY` — parallel worker sessions probing/scraping cases (default
-  `4`). Downloads are globally capped (24 in flight at once).
+  `8`; each uses one Browserbase session). Downloads are globally capped (24 in
+  flight at once). Raise toward `BROWSERBASE_MAX_CONCURRENCY` for large sweeps;
+  throughput tapers off once Browserbase's captcha solver saturates.
 - `BROWSERBASE_MAX_CONCURRENCY` — ceiling on concurrent Browserbase sessions,
   matching your plan's "concurrent browsers" limit (default `25` = Developer;
   set `100` for Startup only when this key won't contend with production).
