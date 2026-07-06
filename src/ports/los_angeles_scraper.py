@@ -527,6 +527,7 @@ class LosAngelesScraper(TrialScraper):
         did = doc["docId"]
         # No per-doc line here — the case's progress bar carries this now.
         tab = await page.context.new_page()
+        completed = False
         try:
             if not await self._trigger_download(tab, doc):
                 return None
@@ -535,10 +536,16 @@ class LosAngelesScraper(TrialScraper):
             # so the tab never closes mid-transfer. 30s covers a straggler.
             for _ in range(60):
                 if did in {_doc_id_in(n) for n in bb.completed_downloads}:
+                    completed = True
                     break
                 await asyncio.sleep(0.5)
         finally:
             await tab.close()
+        if not completed:
+            # Completion never fired in 30s — the download didn't finish, so
+            # the file isn't in storage. Skip the re-list (it can only come up
+            # empty); resubmission will re-preview this doc fresh.
+            return None
         # Fetch the bytes once via the per-file downloads API; storage sync can
         # lag the completion event a moment, so re-list briefly for stragglers.
         for round_ in range(3):

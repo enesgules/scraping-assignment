@@ -6,6 +6,7 @@ import asyncio
 from datetime import date, datetime
 from typing import cast
 
+import pytest
 from playwright.async_api import Page
 
 from src.browser_base_factory import BrowserBaseFactory
@@ -187,9 +188,5 @@ def test_paging_raises_on_empty_further_page():
     # lost its case state and must fail loudly, not silently truncate.
     page = _FakePage(total_docs=116)
     page.pages[1] = []
-    try:
+    with pytest.raises(RuntimeError, match="no document rows"):
         _collect(page, max_docs=1000)
-    except RuntimeError as exc:
-        assert "no document rows" in str(exc)
-    else:
-        raise AssertionError("expected RuntimeError on empty results page")
