@@ -3,8 +3,6 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
-import io
-import zipfile
 from datetime import datetime
 from typing import cast
 
@@ -14,18 +12,11 @@ from src.ports.los_angeles_scraper import (
     _case_meta,
     _collect_all_documents,
     _doc_id_in,
+    _is_complete_pdf,
     _is_opinion,
     _parse_date,
-    _pdfs_by_doc_id,
+    _pick_download_files,
 )
-
-
-def _zip(files: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        for name, data in files.items():
-            zf.writestr(name, data)
-    return buf.getvalue()
 
 
 def test_doc_id_in():
@@ -34,36 +25,34 @@ def test_doc_id_in():
     assert _doc_id_in("random.pdf") is None
 
 
-def test_pdfs_by_doc_id_maps_and_skips_non_pdf():
-    z = _zip(
-        {
-            "e78869237(1)-1.pdf": b"%PDF-1.7 real\n%%EOF",
-            "notes.txt": b"not a pdf",
-        }
-    )
-    out = _pdfs_by_doc_id(z)
+def test_pick_download_files_maps_and_skips_unrecognized():
+    files = [
+        {"id": "a", "filename": "e78869237(1).pdf", "size": 100},
+        {"id": "b", "filename": "notes.txt", "size": 5},
+    ]
+    out = _pick_download_files(files)
     assert set(out) == {"78869237"}
-    assert out["78869237"].startswith(b"%PDF")
+    assert out["78869237"]["id"] == "a"
 
 
-def test_pdfs_by_doc_id_rejects_truncated():
-    # Starts with %PDF but no %%EOF trailer → a truncated capture, dropped.
-    z = _zip({"e5(1)-1.pdf": b"%PDF-1.7 cut off mid-stream"})
-    assert _pdfs_by_doc_id(z) == {}
+def test_pick_download_files_keeps_largest_duplicate():
+    # A doc captured twice: the truncated (smaller) file loses.
+    files = [
+        {"id": "small", "filename": "e5(1).pdf", "size": 10},
+        {"id": "big", "filename": "e5(2).pdf", "size": 999},
+    ]
+    assert _pick_download_files(files)["5"]["id"] == "big"
 
 
-def test_pdfs_by_doc_id_keeps_largest_duplicate():
-    z = _zip(
-        {
-            "e5(1)-1.pdf": b"%PDF small %%EOF",
-            "e5(2)-2.pdf": b"%PDF the larger capture wins %%EOF",
-        }
-    )
-    assert _pdfs_by_doc_id(z)["5"] == b"%PDF the larger capture wins %%EOF"
+def test_pick_download_files_empty():
+    assert _pick_download_files([]) == {}
 
 
-def test_pdfs_by_doc_id_empty():
-    assert _pdfs_by_doc_id(b"") == {}
+def test_is_complete_pdf():
+    assert _is_complete_pdf(b"%PDF-1.7 real\n%%EOF")
+    assert not _is_complete_pdf(b"%PDF-1.7 cut off mid-stream")  # no trailer
+    assert not _is_complete_pdf(b"<html>error page</html>")
+    assert not _is_complete_pdf(b"")
 
 
 def test_parse_date():

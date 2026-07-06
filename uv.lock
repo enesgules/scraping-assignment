@@ -339,6 +339,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "browserbase" },
+    { name = "httpx" },
     { name = "playwright" },
     { name = "python-dotenv" },
 ]
@@ -352,6 +353,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "browserbase", specifier = ">=1.13.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "playwright", specifier = ">=1.61.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]

@@ -1,10 +1,16 @@
 import asyncio
+from typing import Any
 
+import httpx
 from browserbase import AsyncBrowserbase, RateLimitError
 from browserbase.types.session import Session
 from browserbase.types.session_create_params import BrowserSettings
 from browserbase.types.session_create_response import SessionCreateResponse
 from playwright.async_api import Browser, Page, Playwright, async_playwright
+
+# The per-file downloads API (list files / fetch one) — not wrapped by the
+# Python SDK (<=1.14), so called over plain REST.
+_API = "https://api.browserbase.com/v1"
 
 
 class BrowserBase:
@@ -22,6 +28,12 @@ class BrowserBase:
         self._pw: Playwright | None = None
         self._browser: Browser | None = None
         self._bb_session: Session | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._began: dict[str, str] = {}  # download guid -> suggested filename
+        # Filenames the browser reported fully transferred (CDP download
+        # events) — once a name lands here its tab can close without
+        # truncating the PDF, and the file is (about to be) in storage.
+        self.completed_downloads: set[str] = set()
 
     async def __aenter__(self) -> tuple[Session, Page]:
         await self._semaphore.acquire()
@@ -32,7 +44,8 @@ class BrowserBase:
                 self._bb_session.connect_url
             )
             # Route browser downloads into Browserbase storage so they can be
-            # pulled back with get_downloads(). downloadPath must be "downloads".
+            # pulled back with the downloads API. downloadPath must be
+            # "downloads"; eventsEnabled feeds the completion tracking below.
             cdp = await self._browser.new_browser_cdp_session()
             await cdp.send(  # pyright: ignore[reportUnknownMemberType]
                 "Browser.setDownloadBehavior",
@@ -41,6 +54,19 @@ class BrowserBase:
                     "downloadPath": "downloads",
                     "eventsEnabled": True,
                 },
+            )
+
+            def on_begin(e: dict[str, Any]) -> None:
+                self._began[e["guid"]] = e["suggestedFilename"]
+
+            def on_progress(e: dict[str, Any]) -> None:
+                if e.get("state") == "completed" and e["guid"] in self._began:
+                    self.completed_downloads.add(self._began[e["guid"]])
+
+            cdp.on("Browser.downloadWillBegin", on_begin)
+            cdp.on("Browser.downloadProgress", on_progress)
+            self._http = httpx.AsyncClient(
+                headers={"X-BB-API-Key": self._bb.api_key}, timeout=60.0
             )
             context = self._browser.contexts[0]
             page = context.pages[0]
@@ -67,11 +93,21 @@ class BrowserBase:
                 await asyncio.sleep(2 * 2**attempt)  # 2s, 4s, 8s
         raise AssertionError("unreachable: loop returns or raises")
 
-    async def get_downloads(self) -> bytes:
-        """Zip archive of every file downloaded during this session (or b'')."""
-        assert self._bb_session is not None
-        resp = await self._bb.sessions.downloads.list(self._bb_session.id)
-        return await resp.read()
+    async def list_download_files(self) -> list[dict[str, Any]]:
+        """Metadata for every file downloaded this session: id, filename, size."""
+        assert self._bb_session is not None and self._http is not None
+        resp = await self._http.get(
+            f"{_API}/downloads", params={"sessionId": self._bb_session.id}
+        )
+        resp.raise_for_status()
+        return resp.json()["downloads"]
+
+    async def get_download_file(self, file_id: str) -> bytes:
+        """One downloaded file's bytes, by its listing id."""
+        assert self._http is not None
+        resp = await self._http.get(f"{_API}/downloads/{file_id}")
+        resp.raise_for_status()
+        return resp.content
 
     async def __aexit__(self, *_: object) -> None:
         await self._take_down()
@@ -87,9 +123,15 @@ class BrowserBase:
                 await asyncio.wait_for(self._pw.stop(), timeout=5.0)
         except BaseException:
             pass
+        try:
+            if self._http:
+                await self._http.aclose()
+        except BaseException:
+            pass
         self._browser = None
         self._pw = None
         self._bb_session = None
+        self._http = None
         self._semaphore.release()
 
 
