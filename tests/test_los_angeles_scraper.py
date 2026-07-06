@@ -146,11 +146,3 @@ def test_paging_single_page_case():
     page = _FakePage(total_docs=20)
     docs = _collect(page, max_docs=1000)
     assert len(docs) == 20  # no next page; terminates cleanly
-
-
-if __name__ == "__main__":
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print(f"ok {name}")
-    print("all passed")
