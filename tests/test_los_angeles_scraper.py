@@ -10,6 +10,7 @@ from playwright.async_api import Page
 
 from src.browser_base_factory import BrowserBaseFactory
 from src.ports.los_angeles_scraper import (
+    DocRow,
     LosAngelesScraper,
     _case_meta,
     _collect_all_documents,
@@ -19,6 +20,18 @@ from src.ports.los_angeles_scraper import (
     _parse_date,
     _pick_download_files,
 )
+
+
+def _row(doc_id: str, description: str = "a doc") -> DocRow:
+    return DocRow(
+        docId=doc_id,
+        securityKey="key",
+        caseType="CIV",
+        source="0",
+        caseNumber="X",
+        date="4/9/2019",
+        description=description,
+    )
 
 
 def test_doc_id_in():
@@ -78,10 +91,7 @@ def test_download_pool_resubmits_failed_doc():
                     fut.set_result(pdf)
 
         task = asyncio.create_task(consumer())
-        selected = [
-            {"docId": "1", "description": "a", "caseNumber": "X"},
-            {"docId": "2", "description": "b", "caseNumber": "X"},
-        ]
+        selected = [_row("1"), _row("2")]
         try:
             got = await scraper._download_documents("X", selected)
         finally:
@@ -124,8 +134,8 @@ class _FakePage:
     50 docs/page so we can test the paging loop without a browser."""
 
     def __init__(self, total_docs: int) -> None:
-        self.pages = [
-            [{"docId": str(i)} for i in range(p, min(p + 50, total_docs))]
+        self.pages: list[list[DocRow]] = [
+            [_row(str(i)) for i in range(p, min(p + 50, total_docs))]
             for p in range(0, total_docs, 50)
         ] or [[]]
         self.current = 1
@@ -139,7 +149,7 @@ class _FakePage:
         self.current = int(url.split("page=")[1])
 
 
-def _collect(page: _FakePage, max_docs: int) -> list[dict[str, str]]:
+def _collect(page: _FakePage, max_docs: int) -> list[DocRow]:
     pager = list(range(2, len(page.pages) + 1))  # page 1's pager, as _search sees it
     return asyncio.run(
         _collect_all_documents(cast(Page, page), page.pages[0], max_docs, pager)

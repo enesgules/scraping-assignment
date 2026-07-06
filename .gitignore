@@ -3,3 +3,5 @@ __pycache__/
 
 cases.json
 cases.json.tmp
+failures.json
+failures.json.tmp

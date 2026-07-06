@@ -19,11 +19,12 @@ import asyncio
 import hashlib
 import os
 import re
+import sys
 import time
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime
 from html import unescape
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import quote
 
 from playwright.async_api import Error as PlaywrightError
@@ -33,6 +34,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from ..browser_base_factory import BrowserBase, BrowserBaseFactory
 from ..models import (
     InsertCase,
+    RecordFailure,
     ScrapedTrialCase,
     ScrapedTrialDocument,
     TrialScraper,
@@ -40,6 +42,20 @@ from ..models import (
 from .los_angeles_case_numbers import generate_case_numbers
 
 BASE = "https://www.lacourt.ca.gov/paos/v2web3"
+
+
+class DocRow(TypedDict):
+    """One document row as extracted by ``_DOC_ROWS`` — the JS/Python contract.
+    All five preview() args plus the row's display columns."""
+
+    docId: str
+    securityKey: str
+    caseType: str
+    source: str
+    caseNumber: str
+    date: str
+    description: str
+
 
 # Pull every document row out of a results table root: date, description, and
 # the preview(id, securityKey, caseType, source, caseNumber) call args. Works
@@ -120,11 +136,6 @@ _OPINION_HINTS = ("opinion", "ruling", "order", "judgment", "minute order")
 # captcha-gated previews is structural: _TABS_PER_SESSION x workers.
 _TABS_PER_SESSION = 3
 
-# LA_MAX_DOCS=0 means "every document in the case". Encoded as a cap larger than
-# any real case (biggest seen ~100 docs) so the len(docs) < cap comparison and
-# the docs[:cap] slice both just work. ponytail: bump if a case ever exceeds it.
-_NO_DOC_CAP = 1_000_000
-
 
 class LosAngelesScraper(TrialScraper):
     scraper_id = "los_angeles"
@@ -141,8 +152,9 @@ class LosAngelesScraper(TrialScraper):
         raw = os.environ.get("LA_CASE_NUMBERS", "")
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
         self.max_cases = int(os.environ.get("LA_MAX_CASES", "50"))
-        # 0 / unset = every document in the case (no cap).
-        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "0")) or _NO_DOC_CAP
+        # 0 / unset = every document in the case: sys.maxsize makes the
+        # len(docs) < cap comparison and the docs[:cap] slice both just work.
+        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "0")) or sys.maxsize
         # Worker sessions (each probes + downloads + runs pool tabs). Measured
         # sweet spot ~16: throughput rose 8->16 (20.6->23.7 docs/min) then FELL
         # at 25 (16.0, 11% of docs failed) as ~75 concurrent captchas overload
@@ -156,22 +168,24 @@ class LosAngelesScraper(TrialScraper):
         # Shared download pool: any worker session's consumers execute any
         # case's preview jobs (securityKeys are session-independent), so one
         # case's captchas solve across ALL sessions at once.
-        self._dl_queue: asyncio.Queue[
-            tuple[dict[str, str], asyncio.Future[bytes | None]]
-        ] = asyncio.Queue()
+        self._dl_queue: asyncio.Queue[tuple[DocRow, asyncio.Future[bytes | None]]] = (
+            asyncio.Queue()
+        )
         # Workers still probing/downloading. A worker that runs out of work
         # keeps its pool tabs alive until this hits zero, so the run's last
         # case solves its captchas on the FULL pool, not a shrinking one.
         self._active_workers = 0
         self._all_workers_done = asyncio.Event()
 
-    async def scrape(self, insert_case: InsertCase) -> None:
+    async def scrape(
+        self, insert_case: InsertCase, record_failure: RecordFailure
+    ) -> None:
         # Open the full complement even when there are fewer explicit case
         # numbers than workers: a worker with nothing left to probe parks and
         # its pool tabs keep solving, so extra sessions are download-only
         # muscle (one case's 60 docs solve across 4 sessions, not 1).
         workers = self.concurrency
-        docs_label = "all" if self.max_docs >= _NO_DOC_CAP else self.max_docs
+        docs_label = "all" if self.max_docs == sys.maxsize else self.max_docs
         print(
             f"[los_angeles] starting — up to {self.max_cases} case(s), "
             f"{docs_label} doc(s) each; opening {workers} browser session(s)…"
@@ -180,7 +194,10 @@ class LosAngelesScraper(TrialScraper):
         self._active_workers = workers
         case_iter = iter(self._target_case_numbers())
         results = await asyncio.gather(
-            *(self._worker(case_iter, insert_case) for _ in range(workers)),
+            *(
+                self._worker(case_iter, insert_case, record_failure)
+                for _ in range(workers)
+            ),
             return_exceptions=True,  # one dead session must not kill the rest
         )
         for exc in results:
@@ -202,7 +219,12 @@ class LosAngelesScraper(TrialScraper):
             f"{self._attempted} case number(s) probed"
         )
 
-    async def _worker(self, case_iter: Iterator[str], insert_case: InsertCase) -> None:
+    async def _worker(
+        self,
+        case_iter: Iterator[str],
+        insert_case: InsertCase,
+        record_failure: RecordFailure,
+    ) -> None:
         """Pull case numbers off the shared iterator until the quota is filled
         or the numbers run out, probing and downloading in ONE long-lived
         session so there's no fresh session (or re-search) per case. When out
@@ -257,10 +279,18 @@ class LosAngelesScraper(TrialScraper):
                         print(f"[{case_number}] found documents — downloading")
                         try:
                             case = await self._scrape_case(
-                                page, case_number, docs, html, pages
+                                page, case_number, docs, html, pages, record_failure
                             )
                         except Exception as exc:
                             print(f"[{case_number}] error, skipping: {exc!r}")
+                            # The case is known to have documents; leave a
+                            # record so a later run can retry the whole case.
+                            await record_failure(
+                                {
+                                    "case_number": case_number,
+                                    "reason": f"case scrape failed: {exc!r}",
+                                }
+                            )
                             self._claimed -= 1  # slot didn't pan out; free it
                             continue
                         if case is None:
@@ -295,7 +325,7 @@ class LosAngelesScraper(TrialScraper):
 
     async def _search(
         self, page: Page, case_number: str
-    ) -> tuple[list[dict[str, str]], str, list[int]]:
+    ) -> tuple[list[DocRow], str, list[int]]:
         """Submit the case number via in-page fetch (see _SEARCH_FETCH) and
         return (page 1's document rows, results HTML, pager page numbers) —
         ([], "", []) if the case has none. The page itself stays parked on the
@@ -304,7 +334,7 @@ class LosAngelesScraper(TrialScraper):
         session/token went stale, in which case the guest session is
         re-established and the search retried once."""
 
-        async def attempt() -> tuple[list[dict[str, str]], str, list[int]]:
+        async def attempt() -> tuple[list[DocRow], str, list[int]]:
             if "/DocumentImages/SearchCaseNumber" not in page.url:
                 await page.goto(
                     f"{BASE}/DocumentImages/SearchCaseNumber",
@@ -341,9 +371,10 @@ class LosAngelesScraper(TrialScraper):
         self,
         page: Page,
         case_number: str,
-        docs: list[dict[str, str]],
+        docs: list[DocRow],
         html: str,
         pages: list[int],
+        record_failure: RecordFailure,
     ) -> ScrapedTrialCase | None:
         # docs/html/pages come from the probe search in this same session — no
         # re-search. html is the page-1 results HTML; it carries case metadata.
@@ -366,12 +397,19 @@ class LosAngelesScraper(TrialScraper):
                     f"  [{case_number}] doc {d['docId']} could not be "
                     "downloaded — skipping it"
                 )
+                # The DocRow carries everything a later run needs to refetch.
+                await record_failure(
+                    {"case_number": case_number, "reason": "download failed", **d}
+                )
                 continue
             docket_date = _parse_date(d["date"])
             if docket_date is None:
                 print(
                     f"  [{case_number}] doc {d['docId']} has an unreadable "
                     f"date {d['date']!r} — skipping it"
+                )
+                await record_failure(
+                    {"case_number": case_number, "reason": "unreadable date", **d}
                 )
                 continue
             documents.append(
@@ -401,7 +439,7 @@ class LosAngelesScraper(TrialScraper):
         )
 
     async def _download_documents(
-        self, case_number: str, selected: list[dict[str, str]]
+        self, case_number: str, selected: list[DocRow]
     ) -> dict[str, bytes]:
         """Download every selected doc via the shared pool and return
         {docId: pdf_bytes}. Each doc becomes a queue job executed by whichever
@@ -448,7 +486,7 @@ class LosAngelesScraper(TrialScraper):
                     fut.set_result(None)
 
     async def _execute_job(
-        self, bb: BrowserBase, page: Page, doc: dict[str, str]
+        self, bb: BrowserBase, page: Page, doc: DocRow
     ) -> bytes | None:
         """Preview one doc in a fresh tab of this session and return its PDF
         bytes — None if the download never starts or lands incomplete."""
@@ -480,7 +518,7 @@ class LosAngelesScraper(TrialScraper):
                 return data if _is_complete_pdf(data) else None
         return None
 
-    async def _trigger_download(self, page: Page, doc: dict[str, str]) -> bool:
+    async def _trigger_download(self, page: Page, doc: DocRow) -> bool:
         """Open the captcha-gated Preview once and return True if Chrome starts
         the PDF download (False if it never starts). Browserbase solves the
         captcha while we wait; retrying is handled by _download_documents."""
@@ -505,10 +543,10 @@ class LosAngelesScraper(TrialScraper):
 
 async def _collect_all_documents(
     page: Page,
-    docs: list[dict[str, str]],
+    docs: list[DocRow],
     max_docs: int,
     page_numbers: list[int],
-) -> list[dict[str, str]]:
+) -> list[DocRow]:
     """Walk the results pager, returning page 1's ``docs`` plus each further
     page's documents until we have enough for max_docs or run out of pages.
     Results hold 50 docs per page; further pages are at
