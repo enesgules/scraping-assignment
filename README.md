@@ -37,11 +37,11 @@ Optional env knobs:
   enumeration (e.g. `LA_CASE_NUMBERS=19STCV12345`, a verified case with imaged
   documents). Recommended for a quick demo: the default sweep probes sequence
   numbers from `00001` and most are empty.
-- `LA_MAX_CASES` — stop after this many cases yield documents (default `1`).
-- `LA_MAX_DOCS` — documents downloaded per case (default `5`).
-- `LA_CONCURRENCY` — parallel Browserbase sessions, each working its own case
-  numbers (default `2`). Within a case, documents download concurrently in
-  separate tabs regardless of this setting.
+- `LA_MAX_CASES` — stop after this many cases yield documents (default `3`).
+- `LA_MAX_DOCS` — documents downloaded per case (default `10`).
+- `LA_CONCURRENCY` — parallel worker sessions probing/scraping cases (default
+  `4`). Downloads are globally capped (16 in flight at once), so more than
+  ~4–6 workers gives little extra throughput.
 
 ## How it works
 

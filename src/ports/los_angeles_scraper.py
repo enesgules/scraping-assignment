@@ -117,14 +117,16 @@ class LosAngelesScraper(TrialScraper):
         self, to_date: date, from_date: date, browser: BrowserBaseFactory
     ) -> None:
         super().__init__(to_date, from_date, browser)
-        # Runtime knobs (see README), read once here. Small, bounded run by
-        # default: prove the pipeline on one or two real cases rather than
-        # sweep thousands of empty sequence numbers.
+        # Runtime knobs (see README), read once here. Defaults give a small but
+        # non-trivial run — a few real cases, downloaded concurrently — not a
+        # sweep of thousands of empty sequence numbers.
         raw = os.environ.get("LA_CASE_NUMBERS", "")
         self.case_numbers = [c.strip() for c in raw.split(",") if c.strip()]
-        self.max_cases = int(os.environ.get("LA_MAX_CASES", "1"))
-        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "5"))
-        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "2"))
+        self.max_cases = int(os.environ.get("LA_MAX_CASES", "3"))
+        self.max_docs = int(os.environ.get("LA_MAX_DOCS", "10"))
+        # Worker sessions. Downloads are globally capped at
+        # _MAX_CONCURRENT_DOWNLOADS, so more than ~4-6 workers rarely helps.
+        self.concurrency = int(os.environ.get("LA_CONCURRENCY", "4"))
         self._attempted = 0
         self._scraped = 0
         # Caps concurrent downloads across all workers (see constant above).
